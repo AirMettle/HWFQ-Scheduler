@@ -1,0 +1,68 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.out
+
+# Executables
+basic_config
+custom_allocator
+test_scheduler
+test_group_scheduler
+test_config
+test_single
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Compiler output
+*.i
+*.s
+*.bc
+
+# Static analysis
+*.sarif
+cppcheck-*.xml
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Tags and cscope
+tags
+TAGS
+cscope.*
+*.taghl
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Memory profiling
+*.massif
+*.callgrind
+*.cachegrind
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+coverage/
+*.coverage
+
+# Documentation build
+docs/_build/
+*.pdf
+
+# OS specific
+Thumbs.db
