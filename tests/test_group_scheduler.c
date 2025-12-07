@@ -43,7 +43,7 @@ void test_init_destroy(void)
     hwfq_scheduler_t *parent = create_test_parent();
     TEST_ASSERT(parent != NULL, "Failed to create parent scheduler");
 
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
     TEST_ASSERT(gs != NULL, "Failed to initialize group scheduler");
     TEST_ASSERT(group_scheduler_is_empty(gs), "New scheduler should be empty");
     TEST_ASSERT(group_scheduler_get_session_count(gs) == 0, "Session count should be 0");
@@ -57,7 +57,7 @@ void test_init_destroy(void)
 void test_single_entry_single_session(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Configure entry with rate
     group_entry_config_t entry_cfg = {.entry_id = 0,
@@ -95,7 +95,7 @@ void test_single_entry_single_session(void)
 void test_multiple_sessions_same_entry(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     group_entry_config_t entry_cfg = {
         .entry_id = 0,
@@ -143,7 +143,7 @@ void test_multiple_sessions_same_entry(void)
 void test_multiple_entries_different_rates(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Configure 3 entries with different rates
     group_entry_config_t entry0 = {
@@ -188,7 +188,7 @@ void test_multiple_entries_different_rates(void)
 void test_weight_based_allocation(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Configure 2 entries with weights (70:30 ratio)
     group_entry_config_t entry0 = {
@@ -222,7 +222,7 @@ void test_weight_based_allocation(void)
 void test_mixed_rate_and_weight(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Entry 0: explicit rate (500 MB/sec)
     group_entry_config_t entry0 = {
@@ -252,7 +252,7 @@ void test_mixed_rate_and_weight(void)
 void test_virtual_time_advancement(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     group_entry_config_t entry_cfg = {
         .entry_id = 0,
@@ -283,7 +283,7 @@ void test_virtual_time_advancement(void)
 void test_empty_queue_dequeue(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     session_state_t *s = group_scheduler_dequeue(gs);
     TEST_ASSERT(s == NULL, "Dequeue from empty queue should return NULL");
@@ -298,7 +298,7 @@ void test_empty_queue_dequeue(void)
 void test_entry_config_validation(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Invalid: zero rate
     group_entry_config_t invalid_rate = {
@@ -321,7 +321,7 @@ void test_entry_config_validation(void)
 void test_overbooking_prevention(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Configure entry with rate equal to total capacity
     group_entry_config_t entry0 = {
@@ -346,7 +346,7 @@ void test_overbooking_prevention(void)
 void test_entry_reconfiguration(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     // Initial configuration
     group_entry_config_t entry_cfg = {
@@ -376,7 +376,7 @@ void test_entry_reconfiguration(void)
 void test_remove_entry(void)
 {
     hwfq_scheduler_t *parent = create_test_parent();
-    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL);
+    group_scheduler_t *gs = group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
 
     group_entry_config_t entry_cfg = {
         .entry_id = 0,

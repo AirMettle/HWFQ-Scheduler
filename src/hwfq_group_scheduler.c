@@ -1,9 +1,19 @@
 #define _POSIX_C_SOURCE 199309L
-
 #include "hwfq_group_scheduler_internal.h"
+#include "hwfq_entry_pool.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+// ============================================================================
+// Rate Margin Configuration
+// ============================================================================
+
+// Apply a 1/2 margin factor to effective rates for work-conserving behavior.
+// This allows virtual time to advance more by jumping to the next start time
+// rather than strictly incrementing by work, providing better scheduling margin.
+// The factor is applied uniformly to all entries, preserving fairness ratios.
+#define HWFQ_RATE_MARGIN_SHIFT 1  // Divide by 2 (right shift by 1)
 
 // ============================================================================
 // Helper Functions for Rate Calculations
@@ -11,14 +21,28 @@
 
 uint64_t calculate_effective_rate(const group_scheduler_t *gs, const entry_config_t *entry)
 {
+    uint64_t rate;
+
     if (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE) {
-        return entry->allocation.rate;
+        rate = entry->allocation.rate;
+    } else {
+        if (gs->total_weight == 0) {
+            return 0;
+        }
+        uint64_t available = gs->total_capacity - gs->allocated_rate_capacity;
+        rate = (entry->allocation.weight * available) / gs->total_weight;
     }
-    if (gs->total_weight == 0) {
-        return 0;
+
+    // Apply rate margin factor (divide by 2) for work-conserving behavior
+    // This provides margin for virtual time advancement via jump-ahead
+    rate = rate >> HWFQ_RATE_MARGIN_SHIFT;
+
+    // Ensure rate doesn't go to zero
+    if (rate == 0) {
+        rate = 1;
     }
-    uint64_t available = gs->total_capacity - gs->allocated_rate_capacity;
-    return (entry->allocation.weight * available) / gs->total_weight;
+
+    return rate;
 }
 
 void recalculate_weight_based_rates(group_scheduler_t *gs)
@@ -36,10 +60,12 @@ void recalculate_weight_based_rates(group_scheduler_t *gs)
 // Group Scheduler Lifecycle
 // ============================================================================
 
-group_scheduler_t *group_scheduler_init(hwfq_scheduler_t *parent, uint32_t num_groups,
-                                        uint32_t bins_per_group, uint64_t total_capacity)
+// Internal helper to initialize common group scheduler fields
+static group_scheduler_t *group_scheduler_init_common(hwfq_scheduler_t *parent, uint32_t num_groups,
+                                                       uint32_t bins_per_group, uint64_t total_capacity,
+                                                       uint32_t max_entries)
 {
-    if (parent == NULL || num_groups == 0 || bins_per_group == 0) {
+    if (parent == NULL || num_groups == 0 || bins_per_group == 0 || max_entries == 0) {
         return NULL;
     }
     group_scheduler_t *gs = (group_scheduler_t *)hwfq_alloc(parent, sizeof(group_scheduler_t));
@@ -69,22 +95,60 @@ group_scheduler_t *group_scheduler_init(hwfq_scheduler_t *parent, uint32_t num_g
     }
     memset(gs->bin_sessions, 0, sizeof(session_state_t *) * gs->num_bins);
     memset(gs->group_bitfield, 0, sizeof(gs->group_bitfield));
-    gs->max_entries = parent->config.max_tenants;
-    gs->entries = (entry_config_t *)hwfq_alloc(parent, sizeof(entry_config_t) * gs->max_entries);
+    gs->max_entries = max_entries;
+    gs->virtual_time = 0;
+    gs->active_session_count = 0;
+    gs->min_finish_time = UINT64_MAX;
+    gs->min_start_time = UINT64_MAX;
+    gs->min_session = NULL;
+    gs->allocated_rate_capacity = 0;
+    gs->total_weight = 0;
+    gs->configured_entries_head = NULL;
+    return gs;
+}
+
+group_scheduler_t *group_scheduler_init(hwfq_scheduler_t *parent, uint32_t num_groups,
+                                        uint32_t bins_per_group, uint64_t total_capacity,
+                                        uint32_t max_entries)
+{
+    group_scheduler_t *gs = group_scheduler_init_common(parent, num_groups, bins_per_group,
+                                                         total_capacity, max_entries);
+    if (gs == NULL) {
+        return NULL;
+    }
+
+    // Local array mode: allocate entries array directly
+    gs->entries = (entry_config_t *)hwfq_alloc(parent, sizeof(entry_config_t) * max_entries);
     if (gs->entries == NULL) {
         hwfq_free(parent, gs->bin_sessions);
         hwfq_free(parent, gs->bin_bitfield);
         hwfq_free(parent, gs);
         return NULL;
     }
-    memset(gs->entries, 0, sizeof(entry_config_t) * gs->max_entries);
-    gs->virtual_time = 0;
-    gs->active_session_count = 0;
-    gs->min_finish_time = UINT64_MAX;
-    gs->min_start_time = UINT64_MAX;
-    gs->allocated_rate_capacity = 0;
-    gs->total_weight = 0;
-    gs->configured_entries_head = NULL;
+    memset(gs->entries, 0, sizeof(entry_config_t) * max_entries);
+    gs->entry_pool = NULL;  // Not using shared pool
+    return gs;
+}
+
+group_scheduler_t *group_scheduler_init_with_pool(hwfq_scheduler_t *parent, uint32_t num_groups,
+                                                   uint32_t bins_per_group, uint64_t total_capacity,
+                                                   uint32_t max_entries, hwfq_entry_pool_t *entry_pool)
+{
+    if (entry_pool == NULL) {
+        return NULL;
+    }
+
+    group_scheduler_t *gs = group_scheduler_init_common(parent, num_groups, bins_per_group,
+                                                         total_capacity, max_entries);
+    if (gs == NULL) {
+        return NULL;
+    }
+
+    // Shared pool mode: no local entries array
+    gs->entries = NULL;
+    gs->entry_pool = entry_pool;
+    gs->entry_count = 0;
+    memset(gs->entry_hash, 0, sizeof(gs->entry_hash));
     return gs;
 }
 
@@ -93,6 +157,17 @@ void group_scheduler_destroy(hwfq_scheduler_t *parent, group_scheduler_t *gs)
     if (parent == NULL || gs == NULL) {
         return;
     }
+
+    // If using shared pool, free all allocated entries back to pool
+    if (gs->entry_pool != NULL) {
+        entry_config_t *entry = gs->configured_entries_head;
+        while (entry != NULL) {
+            entry_config_t *next = entry->next_configured;
+            hwfq_entry_pool_free(gs->entry_pool, entry);
+            entry = next;
+        }
+    }
+
     if (gs->entries != NULL) {
         hwfq_free(parent, gs->entries);
     }
@@ -103,6 +178,79 @@ void group_scheduler_destroy(hwfq_scheduler_t *parent, group_scheduler_t *gs)
         hwfq_free(parent, gs->bin_bitfield);
     }
     hwfq_free(parent, gs);
+}
+
+// ============================================================================
+// Entry Lookup Helper Functions
+// ============================================================================
+
+entry_config_t *group_scheduler_find_entry(group_scheduler_t *gs, group_entry_id_t entry_id)
+{
+    if (gs == NULL) {
+        return NULL;
+    }
+
+    // Local array mode: direct index access
+    if (gs->entries != NULL) {
+        if (entry_id >= gs->max_entries) {
+            return NULL;
+        }
+        entry_config_t *entry = &gs->entries[entry_id];
+        return entry->configured ? entry : NULL;
+    }
+
+    // Shared pool mode: search hash table
+    uint32_t hash = entry_id_hash(entry_id);
+    entry_config_t *entry = gs->entry_hash[hash];
+    while (entry != NULL) {
+        if (entry->entry_id == entry_id) {
+            return entry;
+        }
+        entry = entry->hash_next;
+    }
+    return NULL;
+}
+
+entry_config_t *group_scheduler_get_or_create_entry(group_scheduler_t *gs, group_entry_id_t entry_id)
+{
+    if (gs == NULL) {
+        return NULL;
+    }
+
+    // Local array mode: direct index access
+    if (gs->entries != NULL) {
+        if (entry_id >= gs->max_entries) {
+            return NULL;
+        }
+        return &gs->entries[entry_id];
+    }
+
+    // Shared pool mode: search hash table first
+    uint32_t hash = entry_id_hash(entry_id);
+    entry_config_t *entry = gs->entry_hash[hash];
+    while (entry != NULL) {
+        if (entry->entry_id == entry_id) {
+            return entry;  // Already exists
+        }
+        entry = entry->hash_next;
+    }
+
+    // Allocate new entry from pool
+    if (gs->entry_pool == NULL) {
+        return NULL;
+    }
+    entry = hwfq_entry_pool_alloc(gs->entry_pool);
+    if (entry == NULL) {
+        return NULL;
+    }
+
+    // Initialize and add to hash table
+    entry->entry_id = entry_id;
+    entry->hash_next = gs->entry_hash[hash];
+    gs->entry_hash[hash] = entry;
+    gs->entry_count++;
+
+    return entry;
 }
 
 // ============================================================================
@@ -129,7 +277,13 @@ int group_scheduler_configure_entry(group_scheduler_t *gs, const group_entry_con
         config->allocation.weight == 0) {
         return HWFQ_ERR_INVALID_ARG;
     }
-    entry_config_t *entry = &gs->entries[config->entry_id];
+
+    // Get or create entry (handles both local array and shared pool modes)
+    entry_config_t *entry = group_scheduler_get_or_create_entry(gs, config->entry_id);
+    if (entry == NULL) {
+        return HWFQ_ERR_NO_MEMORY;
+    }
+
     if (entry->configured) {
         if (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE) {
             gs->allocated_rate_capacity -= entry->allocation.rate;
@@ -175,15 +329,20 @@ int group_scheduler_remove_entry(group_scheduler_t *gs, group_entry_id_t entry_i
     if (entry_id >= gs->max_entries) {
         return HWFQ_ERR_INVALID_ARG;
     }
-    entry_config_t *entry = &gs->entries[entry_id];
-    if (!entry->configured) {
+
+    // Find entry using helper (handles both local array and shared pool modes)
+    entry_config_t *entry = group_scheduler_find_entry(gs, entry_id);
+    if (entry == NULL || !entry->configured) {
         return HWFQ_ERR_NOT_FOUND;
     }
+
     if (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE) {
         gs->allocated_rate_capacity -= entry->allocation.rate;
     } else {
         gs->total_weight -= entry->allocation.weight;
     }
+
+    // Remove from configured entries list
     if (gs->configured_entries_head == entry) {
         gs->configured_entries_head = entry->next_configured;
     } else {
@@ -195,10 +354,28 @@ int group_scheduler_remove_entry(group_scheduler_t *gs, group_entry_id_t entry_i
             prev->next_configured = entry->next_configured;
         }
     }
-    entry->configured = false;
-    entry->calculated_rate = 0;
-    entry->last_finish_time = 0;
-    entry->next_configured = NULL;
+
+    // Handle shared pool mode: remove from hash table and free to pool
+    if (gs->entry_pool != NULL) {
+        uint32_t hash = entry_id_hash(entry_id);
+        entry_config_t **pp = &gs->entry_hash[hash];
+        while (*pp != NULL) {
+            if (*pp == entry) {
+                *pp = entry->hash_next;
+                break;
+            }
+            pp = &(*pp)->hash_next;
+        }
+        gs->entry_count--;
+        hwfq_entry_pool_free(gs->entry_pool, entry);
+    } else {
+        // Local array mode: just clear the entry
+        entry->configured = false;
+        entry->calculated_rate = 0;
+        entry->last_finish_time = 0;
+        entry->next_configured = NULL;
+    }
+
     recalculate_weight_based_rates(gs);
     return HWFQ_SUCCESS;
 }
@@ -216,8 +393,10 @@ int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, ui
     if (entry_id >= gs->max_entries) {
         return HWFQ_ERR_INVALID_ARG;
     }
-    entry_config_t *entry = &gs->entries[entry_id];
-    if (!entry->configured) {
+
+    // Find entry using helper (handles both local array and shared pool modes)
+    entry_config_t *entry = group_scheduler_find_entry(gs, entry_id);
+    if (entry == NULL || !entry->configured) {
         return HWFQ_ERR_NOT_FOUND;
     }
     uint64_t rate = (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE)
@@ -283,14 +462,11 @@ session_state_t *group_scheduler_dequeue(group_scheduler_t *gs)
     if (gs == NULL || gs->active_session_count == 0) {
         return NULL;
     }
+    // calendar_find_min_session returns the eligible session with minimum finish time
+    // It also handles advancing virtual_time if no sessions are currently eligible
     session_state_t *session = calendar_find_min_session(gs);
     if (session == NULL) {
         return NULL;
-    }
-    // Check eligibility: S_i ≤ V_WF2Q+(t)
-    if (session->start_time > gs->virtual_time) {
-        // Session not eligible yet; advance virtual time to make it eligible
-        gs->virtual_time = session->start_time;
     }
     int ret = calendar_remove_session(gs, session);
     if (ret != HWFQ_SUCCESS) {
@@ -335,12 +511,34 @@ void group_scheduler_update_virtual_time(group_scheduler_t *gs, uint64_t work_co
     if (gs == NULL) {
         return;
     }
+
+    // In WF2Q+, virtual time advances based on the aggregate work done.
+    // When servicing a backlogged system, V advances at rate equal to the
+    // total system capacity. The scaling factor converts work to virtual time.
+    //
+    // For proper fairness, we compute Δt = W / total_capacity (in virtual time units).
+    // With precision scaling: Δt = (W << shift) / total_capacity
+    //
+    // This ensures that entries with higher rates get more opportunities
+    // to be scheduled (smaller service intervals = smaller finish times).
     uint64_t scaled_work = work_completed << HWFQ_TIME_PRECISION_SHIFT;
+
+    // Advance virtual time by work / capacity (scaled)
+    uint64_t delta;
+    if (gs->total_capacity > 0) {
+        delta = scaled_work / gs->total_capacity;
+        if (delta == 0) {
+            delta = 1;  // Minimum advancement
+        }
+    } else {
+        delta = scaled_work;  // Fallback
+    }
+
     uint64_t normal_advance;
-    if (gs->virtual_time > UINT64_MAX - scaled_work) {
+    if (gs->virtual_time > UINT64_MAX - delta) {
         normal_advance = UINT64_MAX;
     } else {
-        normal_advance = gs->virtual_time + scaled_work;
+        normal_advance = gs->virtual_time + delta;
     }
 
     // Jump-ahead: min{S_i} across all backlogged sessions (now cached, O(1))
@@ -397,9 +595,10 @@ int group_scheduler_get_entry_rate(group_scheduler_t *gs, group_entry_id_t entry
     if (entry_id >= gs->max_entries) {
         return HWFQ_ERR_INVALID_ARG;
     }
-    entry_config_t *entry = &gs->entries[entry_id];
 
-    if (!entry->configured) {
+    // Find entry using helper (handles both local array and shared pool modes)
+    entry_config_t *entry = group_scheduler_find_entry(gs, entry_id);
+    if (entry == NULL || !entry->configured) {
         return HWFQ_ERR_NOT_FOUND;
     }
     if (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE) {

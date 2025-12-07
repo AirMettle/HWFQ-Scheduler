@@ -62,16 +62,35 @@ typedef struct {
 // Group Scheduler Lifecycle
 // ============================================================================
 
+// Forward declaration for entry pool
+typedef struct hwfq_entry_pool_t hwfq_entry_pool_t;
+
 // Initialize a group scheduler instance
 //
 // parent - Parent scheduler (for memory allocation context)
 // num_groups - Number of service interval groups (typically 16)
 // bins_per_group - Number of bins per group (typically 2048)
 // total_capacity - Total capacity in work units/sec
+// max_entries - Maximum entry ID + 1 (e.g., max_tenants for system scheduler,
+//               max_flows_per_tenant for tenant scheduler)
 //
 // Returns pointer to group scheduler, or NULL on error
 group_scheduler_t *group_scheduler_init(hwfq_scheduler_t *parent, uint32_t num_groups,
-                                        uint32_t bins_per_group, uint64_t total_capacity);
+                                        uint32_t bins_per_group, uint64_t total_capacity,
+                                        uint32_t max_entries);
+
+// Initialize a group scheduler with shared entry pool
+//
+// Same as group_scheduler_init, but uses a shared entry pool instead of
+// allocating a local entries array. This saves memory when many schedulers
+// would otherwise pre-allocate large entry arrays.
+//
+// entry_pool - Shared entry pool for allocating entries on-demand (must not be NULL)
+//
+// Returns pointer to group scheduler, or NULL on error
+group_scheduler_t *group_scheduler_init_with_pool(hwfq_scheduler_t *parent, uint32_t num_groups,
+                                                   uint32_t bins_per_group, uint64_t total_capacity,
+                                                   uint32_t max_entries, hwfq_entry_pool_t *entry_pool);
 
 // Destroy a group scheduler and free all resources
 //

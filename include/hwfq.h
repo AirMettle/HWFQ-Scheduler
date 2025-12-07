@@ -1,6 +1,7 @@
 #ifndef HWFQ_H
 #define HWFQ_H
 
+#define _POSIX_C_SOURCE 199309L
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -22,6 +23,10 @@ typedef uint32_t hwfq_tenant_id_t;
 // Flow identifier (unique within a tenant)
 typedef uint32_t hwfq_flow_id_t;
 
+// Reserved flow ID (cannot be used for actual flows)
+// Flow ID 0 is reserved to simplify NULL pointer handling
+#define HWFQ_FLOW_ID_RESERVED 0
+
 // ============================================================================
 // Error Codes
 // ============================================================================
@@ -33,6 +38,7 @@ typedef uint32_t hwfq_flow_id_t;
 #define HWFQ_ERR_ALREADY_EXIST -4 // Tenant or flow already exists
 #define HWFQ_ERR_OVERBOOKED -5    // Allocation would exceed total system capacity
 #define HWFQ_ERR_NO_WORK -6       // No work available (dequeue on empty scheduler)
+#define HWFQ_ERR_TENANT_HAS_BACKLOG -7  // Tenant has pending work (must drain before removal)
 #define HWFQ_ERR_INTERNAL -99     // Internal error (should never occur)
 
 // ============================================================================
@@ -58,6 +64,9 @@ typedef struct {
 typedef struct {
     uint32_t max_tenants;          // Maximum number of tenants (e.g., 4000)
     uint32_t max_flows_per_tenant; // Maximum flows per tenant (e.g., 100000)
+    uint32_t max_total_flows;      // Total pre-allocated flow states (all tenants combined)
+                                   // Memory: ~88 bytes per flow + Trie overhead
+                                   // Example: 1M = ~90 MB, 10M = ~900 MB
     uint32_t num_groups;           // Number of service interval groups (default: 16)
     uint32_t bins_per_group;       // Bins per group for finish times (default: 2048)
 
@@ -73,6 +82,15 @@ typedef struct {
 
     // Callback function for when a session is ready to be dequeued
     void (*session_available_fn)(hwfq_scheduler_t *);
+
+    // Callback function for timed-out sessions (NULL = timeouts not reported)
+    // Signature: void callback(scheduler, tenant_id, flow_id, user_data, work_size, timeout_ns)
+    void (*session_timeout_fn)(hwfq_scheduler_t *scheduler,
+                               hwfq_tenant_id_t tenant_id,
+                               hwfq_flow_id_t flow_id,
+                               void *user_data,
+                               size_t work_size,
+                               uint64_t timeout_ns);
 } hwfq_config_t;
 
 // System capacity information
@@ -188,6 +206,24 @@ int hwfq_configure_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
 int hwfq_remove_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
                      hwfq_flow_id_t flow_id);
 
+// Reconfigure an existing flow's resource allocation
+//
+// scheduler - Scheduler handle
+// tenant_id - Tenant owning this flow
+// flow_id   - Flow identifier (must not be HWFQ_FLOW_ID_RESERVED)
+// allocation - New resource allocation
+// returns   - 0 on success, negative error code on failure
+//           - HWFQ_ERR_OVERBOOKED if rate increase exceeds capacity
+//           - HWFQ_ERR_NOT_FOUND if flow doesn't exist
+//           - HWFQ_ERR_INVALID_ARG if flow_id is HWFQ_FLOW_ID_RESERVED
+//
+// NOTE: Adjusting allocation DOWN is always safe.
+//       Adjusting allocation UP requires overbooking check for rate-based.
+int hwfq_reconfigure_flow(hwfq_scheduler_t *scheduler,
+                          hwfq_tenant_id_t tenant_id,
+                          hwfq_flow_id_t flow_id,
+                          const hwfq_allocation_t *allocation);
+
 // ============================================================================
 // Capacity Management and Monitoring APIs
 // ============================================================================
@@ -214,6 +250,7 @@ typedef struct {
     void *user_data;    // User-defined data pointer
     size_t work_size;   // Size of work (bytes, ops, etc.)
     uint64_t timestamp; // Enqueue timestamp (optional)
+    uint64_t timeout_ns; // Per-session timeout in nanoseconds (0 = no timeout)
 } hwfq_session_t;
 
 // Enqueue work for scheduling
@@ -247,9 +284,43 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler, hwfq_session_t *work_out,
 void hwfq_complete(hwfq_scheduler_t *scheduler, const hwfq_session_t *work,
                    hwfq_tenant_id_t tenant_id, hwfq_flow_id_t flow_id, uint64_t completion_time_ns);
 
+// Cancel an in-flight session without completing it
+//
+// scheduler - Scheduler handle
+// work - Session to cancel (matched by user_data, can be NULL to match any)
+// tenant_id - Tenant that owns the session
+// flow_id - Flow that owns the session
+// returns - 0 on success, HWFQ_ERR_NOT_FOUND if session not in-flight
+//
+// This removes the session from the in-flight list and frees capacity,
+// but does NOT update completion statistics.
+// Use this when work is abandoned or errors occur.
+int hwfq_cancel(hwfq_scheduler_t *scheduler, const hwfq_session_t *work,
+                hwfq_tenant_id_t tenant_id, hwfq_flow_id_t flow_id);
+
+// Check for timed-out in-flight sessions and invoke callbacks
+//
+// scheduler - Scheduler handle
+// current_time_ns - Current time in nanoseconds (from monotonic clock)
+// returns - Number of sessions that timed out
+//
+// For each timed-out session:
+// 1. Calls session_timeout_fn callback (if configured)
+// 2. Removes session from in-flight list
+// 3. Frees capacity (subtracts work_size from in_flight_work_size)
+// 4. Calls session_available_fn (if configured and work is queued)
+//
+// Sessions with timeout_ns == 0 never timeout.
+// This function should be called periodically (e.g., every second) by the user.
+uint32_t hwfq_check_timeouts(hwfq_scheduler_t *scheduler, uint64_t current_time_ns);
+
 // ============================================================================
-// Statistics and Monitoring APIs (Stubs for Future Implementation)
+// Statistics and Monitoring APIs
 // ============================================================================
+
+// Special values for hwfq_reset_stats()
+#define HWFQ_ALL_TENANTS  0xFFFFFFFF  // Reset all tenants
+#define HWFQ_ALL_FLOWS    0xFFFFFFFF  // Reset all flows within a tenant
 
 // Per-tenant statistics
 typedef struct {

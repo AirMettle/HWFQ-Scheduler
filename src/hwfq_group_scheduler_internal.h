@@ -82,6 +82,9 @@ typedef struct entry_config_t {
     // Linked list for configured entries (optimization for weight recalculation)
     struct entry_config_t *next_configured;
 
+    // Hash chain for entry lookup (when using shared pool)
+    struct entry_config_t *hash_next;
+
 } entry_config_t;
 
 // ============================================================================
@@ -112,9 +115,21 @@ struct group_scheduler_t {
     // Entry Management
     // ========================================================================
 
-    // Entry configurations (array indexed by entry_id)
-    entry_config_t *entries;
-    uint32_t max_entries;
+    // Entry configurations - two modes:
+    // 1. Local array (entries != NULL, entry_pool == NULL): for system scheduler
+    //    Entries indexed directly by entry_id
+    // 2. Shared pool (entries == NULL, entry_pool != NULL): for flow schedulers
+    //    Entries allocated on-demand from shared pool
+    entry_config_t *entries;          // Local array (NULL if using pool)
+    hwfq_entry_pool_t *entry_pool;    // Shared pool (NULL if using local array)
+    uint32_t max_entries;             // Max entries limit
+
+    // Hash table for entry lookup when using shared pool
+    // Maps entry_id -> entry_config_t*
+    // Only used when entry_pool != NULL
+    #define ENTRY_HASH_SIZE 64
+    entry_config_t *entry_hash[ENTRY_HASH_SIZE];
+    uint32_t entry_count;             // Number of configured entries
 
     // Linked list of configured entries (for efficient iteration)
     entry_config_t *configured_entries_head;
@@ -143,6 +158,7 @@ struct group_scheduler_t {
     uint32_t active_session_count; // Number of sessions in queue
     uint64_t min_finish_time;      // Cached minimum finish time (scaled)
     uint64_t min_start_time; // Cached minimum start time (scaled) for O(1) virtual time update
+    session_state_t *min_session;  // Cached pointer to minimum session
 
     // ========================================================================
     // Parent Context
@@ -190,5 +206,23 @@ uint32_t find_first_set_bit(uint32_t value);
 // Recalculate all weight-based entry rates
 // Called when weights change (entry added/removed/reconfigured)
 void recalculate_weight_based_rates(group_scheduler_t *gs);
+
+// ============================================================================
+// Entry Lookup Functions
+// ============================================================================
+
+// Hash function for entry IDs
+static inline uint32_t entry_id_hash(group_entry_id_t entry_id) {
+    return entry_id % ENTRY_HASH_SIZE;
+}
+
+// Find entry by ID - works for both local array and shared pool modes
+// Returns NULL if entry not found/not configured
+entry_config_t *group_scheduler_find_entry(group_scheduler_t *gs, group_entry_id_t entry_id);
+
+// Get or create entry for configuration
+// For local array: returns pointer to array slot
+// For shared pool: allocates from pool if needed, adds to hash
+entry_config_t *group_scheduler_get_or_create_entry(group_scheduler_t *gs, group_entry_id_t entry_id);
 
 #endif // HWFQ_GROUP_SCHEDULER_INTERNAL_H

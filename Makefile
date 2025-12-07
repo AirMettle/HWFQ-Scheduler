@@ -25,14 +25,26 @@ LIB_NAME = libhwfq.a
 SRC_FILES = $(SRC_DIR)/hwfq_config.c \
             $(SRC_DIR)/hwfq_memory.c \
             $(SRC_DIR)/hwfq_group_scheduler.c \
-            $(SRC_DIR)/hwfq_group_calendar.c
+            $(SRC_DIR)/hwfq_group_calendar.c \
+            $(SRC_DIR)/hwfq_flow_trie.c \
+            $(SRC_DIR)/hwfq_memory_pool.c \
+            $(SRC_DIR)/hwfq_entry_pool.c \
+            $(SRC_DIR)/hwfq_scheduler.c
 
 # Object files
 OBJ_FILES = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRC_FILES))
 
 # Test files
 TEST_FILES = $(TEST_DIR)/test_config.c \
-             $(TEST_DIR)/test_group_scheduler.c
+             $(TEST_DIR)/test_group_scheduler.c \
+             $(TEST_DIR)/test_fairness.c \
+             $(TEST_DIR)/test_hierarchical.c \
+             $(TEST_DIR)/test_statistics.c \
+             $(TEST_DIR)/test_performance.c \
+             $(TEST_DIR)/test_stress.c \
+             $(TEST_DIR)/test_fairness_extended.c \
+             $(TEST_DIR)/test_edge_cases.c \
+             $(TEST_DIR)/test_scale.c
 TEST_BINS = $(patsubst $(TEST_DIR)/%.c,$(BIN_DIR)/%,$(TEST_FILES))
 
 # Example files
@@ -43,10 +55,10 @@ EXAMPLE_BINS = $(patsubst $(EXAMPLE_DIR)/%.c,$(BIN_DIR)/%,$(EXAMPLE_FILES))
 # Compiler flags
 CFLAGS_COMMON = -std=c11 -I$(INCLUDE_DIR) -I$(SRC_DIR) -Wall -Wextra -Wpedantic
 CFLAGS_DEBUG = $(CFLAGS_COMMON) -g -O0 -DDEBUG
-CFLAGS_RELEASE = $(CFLAGS_COMMON) -O2 -DNDEBUG
+CFLAGS_RELEASE = $(CFLAGS_COMMON) -O3 -DNDEBUG
 
 # Linker flags
-LDFLAGS = -L$(LIB_DIR) -lhwfq -lpthread
+LDFLAGS = -L$(LIB_DIR) -lhwfq -lpthread -lm
 
 # Default to debug build
 CFLAGS = $(CFLAGS_DEBUG)
@@ -195,12 +207,18 @@ clean:
 # ============================================================================
 
 # Header dependencies
-$(OBJ_DIR)/hwfq_config.o: $(SRC_DIR)/hwfq_config.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h
+$(OBJ_DIR)/hwfq_config.o: $(SRC_DIR)/hwfq_config.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h $(SRC_DIR)/hwfq_memory_pool.h
 $(OBJ_DIR)/hwfq_memory.o: $(SRC_DIR)/hwfq_memory.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h
 $(OBJ_DIR)/hwfq_group_scheduler.o: $(SRC_DIR)/hwfq_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
 $(OBJ_DIR)/hwfq_group_calendar.o: $(SRC_DIR)/hwfq_group_calendar.c $(INCLUDE_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
+$(OBJ_DIR)/hwfq_flow_trie.o: $(SRC_DIR)/hwfq_flow_trie.c $(SRC_DIR)/hwfq_flow_trie.h $(INCLUDE_DIR)/hwfq.h
+$(OBJ_DIR)/hwfq_memory_pool.o: $(SRC_DIR)/hwfq_memory_pool.c $(SRC_DIR)/hwfq_memory_pool.h $(SRC_DIR)/hwfq_flow_trie.h
+$(OBJ_DIR)/hwfq_entry_pool.o: $(SRC_DIR)/hwfq_entry_pool.c $(SRC_DIR)/hwfq_entry_pool.h $(SRC_DIR)/hwfq_flow_trie.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
+$(OBJ_DIR)/hwfq_scheduler.o: $(SRC_DIR)/hwfq_scheduler.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_memory_pool.h
 
 $(BIN_DIR)/test_config: $(TEST_DIR)/test_config.c $(INCLUDE_DIR)/hwfq.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/test_group_scheduler: $(TEST_DIR)/test_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_fairness: $(TEST_DIR)/test_fairness.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_memory_pool.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_hierarchical: $(TEST_DIR)/test_hierarchical.c $(INCLUDE_DIR)/hwfq.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/basic_config: $(EXAMPLE_DIR)/basic_config.c $(INCLUDE_DIR)/hwfq.h
 $(BIN_DIR)/custom_allocator: $(EXAMPLE_DIR)/custom_allocator.c $(INCLUDE_DIR)/hwfq.h

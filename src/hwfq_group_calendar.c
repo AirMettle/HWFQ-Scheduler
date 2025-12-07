@@ -99,7 +99,7 @@ uint32_t calculate_bin_index_from_finish_time(uint64_t finish_time, uint32_t gro
 }
 
 // ============================================================================
-// Calendar Queue Operations
+// DTS-Calendar Queue Operations (Discrete Time Scheduler)
 // ============================================================================
 
 int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
@@ -143,9 +143,10 @@ int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
         gs->group_bitfield[group_word] |= (1U << group_bit);
     }
 
-    // Update cached minimum finish time and start time for O(1) lookups
+    // Update cached minimum finish time, start time, and min_session for O(1) lookups
     if (session->finish_time < gs->min_finish_time) {
         gs->min_finish_time = session->finish_time;
+        gs->min_session = session;
     }
 
     if (session->start_time < gs->min_start_time) {
@@ -155,55 +156,114 @@ int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
     return HWFQ_SUCCESS;
 }
 
+// Helper: Find eligible session with minimum finish time using bitfield-guided search
+// Returns NULL if no eligible sessions found, also updates min_start_time
+static session_state_t *find_eligible_min_bitfield(group_scheduler_t *gs,
+                                                    uint64_t virtual_time,
+                                                    uint64_t *out_min_start_time)
+{
+    session_state_t *eligible_min = NULL;
+    uint64_t min_eligible_finish = UINT64_MAX;
+    uint64_t min_start_time = UINT64_MAX;
+
+    // Use hierarchical bitfield search: first find active group words,
+    // then search bins within those groups
+    for (uint32_t gword = 0; gword < 32; gword++) {
+        if (gs->group_bitfield[gword] == 0) {
+            continue;  // Skip empty group words (32 bin-groups at a time)
+        }
+
+        // Find active bin-groups within this word
+        uint32_t group_bits = gs->group_bitfield[gword];
+        while (group_bits != 0) {
+            uint32_t group_bit = (uint32_t)__builtin_ctz(group_bits);
+            uint32_t bin_group_idx = gword * 32 + group_bit;
+            uint32_t bin_start = bin_group_idx * 32;
+            uint32_t bin_end = bin_start + 32;
+
+            if (bin_end > gs->num_bins) {
+                bin_end = gs->num_bins;
+            }
+
+            // Search bins in this group using bin bitfield
+            uint32_t word_idx = bin_start / 32;
+            uint32_t bin_bits = gs->bin_bitfield[word_idx];
+
+            while (bin_bits != 0) {
+                uint32_t bit_pos = (uint32_t)__builtin_ctz(bin_bits);
+                uint32_t bin_idx = word_idx * 32 + bit_pos;
+
+                if (bin_idx >= bin_end) break;
+
+                // Check all sessions in this bin
+                session_state_t *curr = gs->bin_sessions[bin_idx];
+                while (curr != NULL) {
+                    // Track minimum start time
+                    if (curr->start_time < min_start_time) {
+                        min_start_time = curr->start_time;
+                    }
+
+                    // Check eligibility and find minimum finish time
+                    if (curr->start_time <= virtual_time) {
+                        if (curr->finish_time < min_eligible_finish) {
+                            min_eligible_finish = curr->finish_time;
+                            eligible_min = curr;
+                        }
+                    }
+                    curr = curr->next;
+                }
+
+                // Clear this bit and continue
+                bin_bits &= ~(1U << bit_pos);
+            }
+
+            // Clear this group bit and continue
+            group_bits &= ~(1U << group_bit);
+        }
+    }
+
+    if (out_min_start_time != NULL) {
+        *out_min_start_time = min_start_time;
+    }
+
+    return eligible_min;
+}
+
 session_state_t *calendar_find_min_session(group_scheduler_t *gs)
 {
     if (gs == NULL || gs->active_session_count == 0) {
         return NULL;
     }
 
-    // Use hierarchical bitfields to efficiently find minimum finish time
-    // We need to scan all non-empty bins to find the true minimum
+    // WF2Q+ algorithm:
+    // 1. Find the eligible session (start_time <= virtual_time) with minimum finish_time
+    // 2. If no eligible sessions, advance virtual_time to min_start_time, then repeat
 
-    session_state_t *global_min = NULL;
-    uint64_t min_finish_time = UINT64_MAX;
+    uint64_t virtual_time = gs->virtual_time;
+    uint64_t min_start_time = UINT64_MAX;
 
-    // Level 1: Scan group bitfield to find non-empty groups
-    for (uint32_t group_word_idx = 0; group_word_idx < 32; group_word_idx++) {
-        if (gs->group_bitfield[group_word_idx] == 0) {
-            continue; // Skip empty groups
-        }
+    // Use bitfield-guided search for eligible session
+    session_state_t *eligible_min = find_eligible_min_bitfield(gs, virtual_time, &min_start_time);
 
-        // Found a group with sessions - scan its bins
-        uint32_t start_bin = group_word_idx * 32 * 32;
-        uint32_t end_bin = start_bin + (32 * 32);
-        if (end_bin > gs->num_bins) {
-            end_bin = gs->num_bins;
-        }
+    // Update cached min_start_time
+    gs->min_start_time = min_start_time;
 
-        // Level 2: Scan bins within this group
-        for (uint32_t bin = start_bin; bin < end_bin; bin++) {
-            if (!test_bin_bit(gs->bin_bitfield, bin)) {
-                continue; // Skip empty bins
-            }
+    // If no eligible sessions found, advance virtual time and try again
+    if (eligible_min == NULL && min_start_time != UINT64_MAX) {
+        // Advance virtual time to make at least one session eligible
+        gs->virtual_time = min_start_time;
+        virtual_time = min_start_time;
 
-            session_state_t *head = gs->bin_sessions[bin];
-            if (head == NULL) {
-                continue;
-            }
-
-            // Find minimum finish time in this bin
-            session_state_t *curr = head;
-            while (curr != NULL) {
-                if (curr->finish_time < min_finish_time) {
-                    min_finish_time = curr->finish_time;
-                    global_min = curr;
-                }
-                curr = curr->next;
-            }
-        }
+        // Re-search with updated virtual time
+        eligible_min = find_eligible_min_bitfield(gs, virtual_time, NULL);
     }
 
-    return global_min;
+    // Update cache
+    if (eligible_min != NULL) {
+        gs->min_finish_time = eligible_min->finish_time;
+    }
+
+    return eligible_min;
 }
 
 int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
@@ -233,20 +293,13 @@ int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
     if (gs->bin_sessions[bin_index] == NULL) {
         clear_bin_bit(gs->bin_bitfield, bin_index);
 
-        // Update group bitfield if entire group is empty
-        uint32_t group_start = (bin_index / 32) * 32;
-        bool group_empty = true;
-        for (uint32_t i = 0; i < 32 && (group_start + i) < gs->num_bins; i++) {
-            if (test_bin_bit(gs->bin_bitfield, group_start + i)) {
-                group_empty = false;
-                break;
-            }
-        }
-
-        if (group_empty) {
-            uint32_t group_bitfield_index = bin_index / 32;
-            uint32_t group_word = group_bitfield_index / 32;
-            uint32_t group_bit = group_bitfield_index % 32;
+        // Update group bitfield if entire 32-bin group is empty
+        // Check the word in bin_bitfield directly (O(1) instead of loop)
+        uint32_t word_idx = bin_index / 32;
+        if (word_idx < gs->bin_bitfield_size && gs->bin_bitfield[word_idx] == 0) {
+            // This 32-bin group is now empty, clear its bit in group_bitfield
+            uint32_t group_word = word_idx / 32;
+            uint32_t group_bit = word_idx % 32;
 
             if (group_word < 32) {
                 gs->group_bitfield[group_word] &= ~(1U << group_bit);
@@ -254,32 +307,49 @@ int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
         }
     }
 
-    // Recalculate cached minimums if we removed the min session
-    // This is O(n) but only happens when the minimum session is removed
-    bool recalc_needed = false;
-
-    if (session->finish_time == gs->min_finish_time) {
+    // Invalidate cached min_session if we removed it
+    if (session == gs->min_session) {
+        gs->min_session = NULL;
         gs->min_finish_time = UINT64_MAX;
-        recalc_needed = true;
     }
 
+    // Recalculate min_start_time if we removed the session with the minimum start time
+    // This is needed for correct virtual time updates
+    // Use bitfield-guided search instead of O(n) full scan
     if (session->start_time == gs->min_start_time) {
         gs->min_start_time = UINT64_MAX;
-        recalc_needed = true;
-    }
 
-    if (recalc_needed && gs->active_session_count > 0) {
-        // Scan all sessions to find new minimums
-        for (uint32_t bin = 0; bin < gs->num_bins; bin++) {
-            session_state_t *curr = gs->bin_sessions[bin];
-            while (curr != NULL) {
-                if (curr->finish_time < gs->min_finish_time) {
-                    gs->min_finish_time = curr->finish_time;
+        // Use hierarchical bitfield search to find new min_start_time
+        for (uint32_t gword = 0; gword < 32; gword++) {
+            if (gs->group_bitfield[gword] == 0) {
+                continue;
+            }
+
+            uint32_t group_bits = gs->group_bitfield[gword];
+            while (group_bits != 0) {
+                uint32_t group_bit = (uint32_t)__builtin_ctz(group_bits);
+                uint32_t bin_group_idx = gword * 32 + group_bit;
+                uint32_t word_idx = bin_group_idx;  // bin_start / 32
+
+                if (word_idx < gs->bin_bitfield_size) {
+                    uint32_t bin_bits = gs->bin_bitfield[word_idx];
+                    while (bin_bits != 0) {
+                        uint32_t bit_pos = (uint32_t)__builtin_ctz(bin_bits);
+                        uint32_t bin_idx = word_idx * 32 + bit_pos;
+
+                        if (bin_idx < gs->num_bins) {
+                            session_state_t *curr = gs->bin_sessions[bin_idx];
+                            while (curr != NULL) {
+                                if (curr->start_time < gs->min_start_time) {
+                                    gs->min_start_time = curr->start_time;
+                                }
+                                curr = curr->next;
+                            }
+                        }
+                        bin_bits &= ~(1U << bit_pos);
+                    }
                 }
-                if (curr->start_time < gs->min_start_time) {
-                    gs->min_start_time = curr->start_time;
-                }
-                curr = curr->next;
+                group_bits &= ~(1U << group_bit);
             }
         }
     }

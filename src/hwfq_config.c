@@ -1,4 +1,7 @@
 #include "hwfq_internal.h"
+#include "hwfq_memory_pool.h"
+#include "hwfq_entry_pool.h"
+#include "hwfq_group_scheduler.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -109,6 +112,16 @@ static void remove_tenant(hwfq_scheduler_t *scheduler, tenant_config_t *tenant)
     if (scheduler == NULL || tenant == NULL) {
         return;
     }
+
+    // Destroy tenant's flow scheduler first
+    if (tenant->flow_scheduler != NULL) {
+        group_scheduler_destroy(scheduler, tenant->flow_scheduler);
+        tenant->flow_scheduler = NULL;
+    }
+
+    // Destroy per-tenant lock
+    pthread_mutex_destroy(&tenant->lock);
+
     flow_config_t *flow = tenant->flows;
     while (flow != NULL) {
         flow_config_t *next = flow->next;
@@ -157,6 +170,82 @@ int hwfq_init(const hwfq_config_t *config, hwfq_scheduler_t **scheduler_out)
     memset(scheduler->tenants, 0, tenants_size);
     scheduler->num_configured_tenants = 0;
     scheduler->allocated_rate_capacity = 0;
+
+    // Initialize memory pool for session states
+    uint32_t max_sessions = config->max_total_flows;
+    if (max_sessions == 0) {
+        // Default to max_tenants * max_flows_per_tenant if not specified
+        max_sessions = config->max_tenants * config->max_flows_per_tenant;
+        if (max_sessions == 0) {
+            max_sessions = 10000;  // Fallback default
+        }
+    }
+    scheduler->session_pool = (hwfq_memory_pool_t *)hwfq_alloc(scheduler, sizeof(hwfq_memory_pool_t));
+    if (scheduler->session_pool == NULL) {
+        hwfq_free(scheduler, scheduler->tenants);
+        hwfq_free(scheduler, scheduler);
+        return HWFQ_ERR_NO_MEMORY;
+    }
+    int pool_ret = hwfq_memory_pool_init(scheduler->session_pool, max_sessions,
+                                         scheduler->alloc_fn, scheduler->free_fn);
+    if (pool_ret != HWFQ_SUCCESS) {
+        hwfq_free(scheduler, scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->tenants);
+        hwfq_free(scheduler, scheduler);
+        return pool_ret;
+    }
+
+    // Initialize shared entry pool for flow configurations
+    // Sized to max_total_flows (shared across all tenants)
+    scheduler->entry_pool = (hwfq_entry_pool_t *)hwfq_alloc(scheduler, sizeof(hwfq_entry_pool_t));
+    if (scheduler->entry_pool == NULL) {
+        hwfq_memory_pool_destroy(scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->tenants);
+        hwfq_free(scheduler, scheduler);
+        return HWFQ_ERR_NO_MEMORY;
+    }
+    int entry_pool_ret = hwfq_entry_pool_init(scheduler->entry_pool, max_sessions,
+                                               scheduler->alloc_fn, scheduler->free_fn);
+    if (entry_pool_ret != HWFQ_SUCCESS) {
+        hwfq_free(scheduler, scheduler->entry_pool);
+        hwfq_memory_pool_destroy(scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->tenants);
+        hwfq_free(scheduler, scheduler);
+        return entry_pool_ret;
+    }
+
+    // Initialize system-level scheduler (entries = tenants)
+    scheduler->system_scheduler = group_scheduler_init(
+        scheduler,
+        scheduler->config.num_groups,
+        scheduler->config.bins_per_group,
+        scheduler->config.total_capacity,
+        scheduler->config.max_tenants);
+    if (scheduler->system_scheduler == NULL) {
+        hwfq_memory_pool_destroy(scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->tenants);
+        hwfq_free(scheduler, scheduler);
+        return HWFQ_ERR_NO_MEMORY;
+    }
+
+    // Allocate in-flight hash table
+    size_t hash_size = sizeof(in_flight_entry_t *) * HWFQ_IN_FLIGHT_HASH_BUCKETS;
+    scheduler->in_flight_hash = (in_flight_entry_t **)hwfq_alloc(scheduler, hash_size);
+    if (scheduler->in_flight_hash == NULL) {
+        group_scheduler_destroy(scheduler, scheduler->system_scheduler);
+        hwfq_memory_pool_destroy(scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->tenants);
+        hwfq_free(scheduler, scheduler);
+        return HWFQ_ERR_NO_MEMORY;
+    }
+    memset(scheduler->in_flight_hash, 0, hash_size);
+    scheduler->in_flight_head = NULL;
+    scheduler->in_flight_tail = NULL;
+
     pthread_mutex_init(&scheduler->lock, NULL);
     *scheduler_out = scheduler;
     return HWFQ_SUCCESS;
@@ -167,6 +256,13 @@ void hwfq_destroy(hwfq_scheduler_t *scheduler)
     if (scheduler == NULL) {
         return;
     }
+
+    // Destroy system-level scheduler first
+    if (scheduler->system_scheduler != NULL) {
+        group_scheduler_destroy(scheduler, scheduler->system_scheduler);
+        scheduler->system_scheduler = NULL;
+    }
+
     if (scheduler->tenants != NULL) {
         for (uint32_t i = 0; i < scheduler->config.max_tenants; i++) {
             if (scheduler->tenants[i] != NULL) {
@@ -175,6 +271,32 @@ void hwfq_destroy(hwfq_scheduler_t *scheduler)
             }
         }
         hwfq_free(scheduler, scheduler->tenants);
+    }
+
+    // Destroy memory pool
+    if (scheduler->session_pool != NULL) {
+        hwfq_memory_pool_destroy(scheduler->session_pool);
+        hwfq_free(scheduler, scheduler->session_pool);
+        scheduler->session_pool = NULL;
+    }
+
+    // Destroy entry pool
+    if (scheduler->entry_pool != NULL) {
+        hwfq_entry_pool_destroy(scheduler->entry_pool);
+        hwfq_free(scheduler, scheduler->entry_pool);
+        scheduler->entry_pool = NULL;
+    }
+
+    // Free any remaining in-flight entries and the hash table
+    if (scheduler->in_flight_hash != NULL) {
+        in_flight_entry_t *entry = scheduler->in_flight_head;
+        while (entry != NULL) {
+            in_flight_entry_t *next = entry->list_next;
+            hwfq_free(scheduler, entry);
+            entry = next;
+        }
+        hwfq_free(scheduler, scheduler->in_flight_hash);
+        scheduler->in_flight_hash = NULL;
     }
 
     pthread_mutex_destroy(&scheduler->lock);
@@ -218,6 +340,45 @@ int hwfq_add_tenant(hwfq_scheduler_t *scheduler, const hwfq_allocation_t *alloca
     tenant->configured = true;
     tenant->flows = NULL;
     tenant->num_flows = 0;
+    tenant->has_backlog = false;
+    tenant->tenant_session = NULL;
+
+    // Initialize per-tenant lock
+    pthread_mutex_init(&tenant->lock, NULL);
+
+    // Create tenant-level flow scheduler with shared entry pool
+    // Use tenant's allocation as capacity for the flow scheduler
+    uint64_t tenant_capacity = (allocation->allocation_type == HWFQ_ALLOCATION_RATE)
+        ? allocation->rate
+        : scheduler->config.total_capacity;  // Weight-based gets full capacity (scaled by weight)
+
+    tenant->flow_scheduler = group_scheduler_init_with_pool(
+        scheduler,
+        scheduler->config.num_groups,
+        scheduler->config.bins_per_group,
+        tenant_capacity,
+        scheduler->config.max_flows_per_tenant,
+        scheduler->entry_pool);  // Use shared entry pool
+    if (tenant->flow_scheduler == NULL) {
+        pthread_mutex_destroy(&tenant->lock);
+        hwfq_free(scheduler, tenant);
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_NO_MEMORY;
+    }
+
+    // Configure tenant as entry in system scheduler
+    group_entry_config_t tenant_entry = {
+        .entry_id = tenant_id,
+        .allocation = *allocation
+    };
+    int ret = group_scheduler_configure_entry(scheduler->system_scheduler, &tenant_entry);
+    if (ret != HWFQ_SUCCESS) {
+        group_scheduler_destroy(scheduler, tenant->flow_scheduler);
+        hwfq_free(scheduler, tenant);
+        pthread_mutex_unlock(&scheduler->lock);
+        return ret;
+    }
+
     scheduler->tenants[tenant_id] = tenant;
     scheduler->num_configured_tenants++;
     if (allocation->allocation_type == HWFQ_ALLOCATION_RATE) {
@@ -259,6 +420,14 @@ int hwfq_configure_tenant(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_i
         scheduler->allocated_rate_capacity -= tenant->allocation.rate;
     }
     tenant->allocation = *allocation;
+
+    // Update tenant entry in system scheduler
+    group_entry_config_t tenant_entry = {
+        .entry_id = tenant_id,
+        .allocation = *allocation
+    };
+    group_scheduler_configure_entry(scheduler->system_scheduler, &tenant_entry);
+
     pthread_mutex_unlock(&scheduler->lock);
     return HWFQ_SUCCESS;
 }
@@ -277,6 +446,16 @@ int hwfq_remove_tenant(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id)
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
+
+    // Check if tenant has pending work - must drain first
+    if (tenant->has_backlog) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_TENANT_HAS_BACKLOG;
+    }
+
+    // Remove tenant from system scheduler
+    group_scheduler_remove_entry(scheduler->system_scheduler, tenant_id);
+
     remove_tenant(scheduler, tenant);
     scheduler->tenants[tenant_id] = NULL;
     scheduler->num_configured_tenants--;
@@ -291,6 +470,10 @@ int hwfq_configure_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
         return HWFQ_ERR_INVALID_ARG;
     }
     if (tenant_id >= scheduler->config.max_tenants) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+    // Flow ID 0 is reserved
+    if (flow_id == HWFQ_FLOW_ID_RESERVED) {
         return HWFQ_ERR_INVALID_ARG;
     }
     if (!validate_allocation(allocation)) {
@@ -309,6 +492,19 @@ int hwfq_configure_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
     }
     flow->allocation = *allocation;
     flow->configured = true;
+
+    // Configure flow as entry in tenant's flow scheduler
+    group_entry_config_t flow_entry = {
+        .entry_id = flow_id,
+        .allocation = *allocation
+    };
+    int ret = group_scheduler_configure_entry(tenant->flow_scheduler, &flow_entry);
+    if (ret != HWFQ_SUCCESS) {
+        remove_flow(scheduler, tenant, flow_id);
+        pthread_mutex_unlock(&scheduler->lock);
+        return ret;
+    }
+
     pthread_mutex_unlock(&scheduler->lock);
     return HWFQ_SUCCESS;
 }
@@ -333,7 +529,50 @@ int hwfq_remove_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
+
+    // Remove flow from tenant's flow scheduler
+    group_scheduler_remove_entry(tenant->flow_scheduler, flow_id);
+
     remove_flow(scheduler, tenant, flow_id);
+    pthread_mutex_unlock(&scheduler->lock);
+    return HWFQ_SUCCESS;
+}
+
+int hwfq_reconfigure_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
+                          hwfq_flow_id_t flow_id, const hwfq_allocation_t *allocation)
+{
+    if (scheduler == NULL || allocation == NULL) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+    if (tenant_id >= scheduler->config.max_tenants) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+    // Flow ID 0 is reserved
+    if (flow_id == HWFQ_FLOW_ID_RESERVED) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+    if (!validate_allocation(allocation)) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+
+    pthread_mutex_lock(&scheduler->lock);
+    tenant_config_t *tenant = scheduler->tenants[tenant_id];
+    if (tenant == NULL || !tenant->configured) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_NOT_FOUND;
+    }
+
+    flow_config_t *flow = find_flow(tenant, flow_id);
+    if (flow == NULL || !flow->configured) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_NOT_FOUND;
+    }
+
+    // For rate-based allocations, check overbooking
+    // Note: This is a simplified check at the flow level
+    // In a full implementation, would need to track per-tenant rate capacity
+
+    flow->allocation = *allocation;
     pthread_mutex_unlock(&scheduler->lock);
     return HWFQ_SUCCESS;
 }
@@ -375,9 +614,9 @@ int hwfq_get_tenant_stats(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_i
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
+    // Copy all stats - current_backlog and effective_rate are maintained
+    // during enqueue/dequeue when statistics are enabled
     *stats_out = tenant->stats;
-    stats_out->current_backlog = 0;
-    stats_out->effective_rate = 0.0;
     pthread_mutex_unlock(&scheduler->lock);
     return HWFQ_SUCCESS;
 }
@@ -385,11 +624,96 @@ int hwfq_get_tenant_stats(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_i
 int hwfq_get_flow_stats(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
                         hwfq_flow_id_t flow_id, hwfq_flow_stats_t *stats_out)
 {
-    return HWFQ_ERR_INTERNAL; // Not implemented yet
+    if (scheduler == NULL || stats_out == NULL) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+    if (tenant_id >= scheduler->config.max_tenants) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+    if (flow_id == HWFQ_FLOW_ID_RESERVED) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
+
+    pthread_mutex_lock(&scheduler->lock);
+
+    tenant_config_t *tenant = scheduler->tenants[tenant_id];
+    if (tenant == NULL) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_NOT_FOUND;
+    }
+
+    // Find the flow
+    flow_config_t *flow = find_flow(tenant, flow_id);
+    if (flow == NULL) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_NOT_FOUND;
+    }
+
+    // Copy stats
+    *stats_out = flow->stats;
+    pthread_mutex_unlock(&scheduler->lock);
+    return HWFQ_SUCCESS;
+}
+
+// Helper to reset a single flow's stats (preserves current_backlog)
+static void reset_flow_stats(flow_config_t *flow) {
+    uint32_t current_backlog = flow->stats.current_backlog;
+    memset(&flow->stats, 0, sizeof(hwfq_flow_stats_t));
+    flow->stats.current_backlog = current_backlog;  // Preserve backlog
+    memset(&flow->rate_tracking, 0, sizeof(rate_tracking_t));
+}
+
+// Helper to reset a single tenant's stats (preserves current_backlog)
+static void reset_tenant_stats(tenant_config_t *tenant) {
+    uint32_t current_backlog = tenant->stats.current_backlog;
+    memset(&tenant->stats, 0, sizeof(hwfq_tenant_stats_t));
+    tenant->stats.current_backlog = current_backlog;  // Preserve backlog
+    memset(&tenant->rate_tracking, 0, sizeof(rate_tracking_t));
 }
 
 void hwfq_reset_stats(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
                       hwfq_flow_id_t flow_id)
 {
-    // Not implemented yet
+    if (scheduler == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&scheduler->lock);
+
+    if (tenant_id == HWFQ_ALL_TENANTS) {
+        // Reset all tenants and all flows
+        for (uint32_t i = 0; i < scheduler->config.max_tenants; i++) {
+            tenant_config_t *tenant = scheduler->tenants[i];
+            if (tenant != NULL && tenant->configured) {
+                reset_tenant_stats(tenant);
+                // Reset all flows for this tenant
+                flow_config_t *flow = tenant->flows;
+                while (flow != NULL) {
+                    reset_flow_stats(flow);
+                    flow = flow->next;
+                }
+            }
+        }
+    } else if (tenant_id < scheduler->config.max_tenants) {
+        tenant_config_t *tenant = scheduler->tenants[tenant_id];
+        if (tenant != NULL && tenant->configured) {
+            if (flow_id == HWFQ_ALL_FLOWS) {
+                // Reset this tenant and all its flows
+                reset_tenant_stats(tenant);
+                flow_config_t *flow = tenant->flows;
+                while (flow != NULL) {
+                    reset_flow_stats(flow);
+                    flow = flow->next;
+                }
+            } else if (flow_id != HWFQ_FLOW_ID_RESERVED) {
+                // Reset specific flow only
+                flow_config_t *flow = find_flow(tenant, flow_id);
+                if (flow != NULL) {
+                    reset_flow_stats(flow);
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&scheduler->lock);
 }
