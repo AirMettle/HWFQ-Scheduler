@@ -44,7 +44,11 @@ TEST_FILES = $(TEST_DIR)/test_config.c \
              $(TEST_DIR)/test_stress.c \
              $(TEST_DIR)/test_fairness_extended.c \
              $(TEST_DIR)/test_edge_cases.c \
-             $(TEST_DIR)/test_scale.c
+             $(TEST_DIR)/test_scale.c \
+             $(TEST_DIR)/test_skew_progressive.c \
+             $(TEST_DIR)/test_data_export.c \
+             $(TEST_DIR)/test_concurrency.c \
+             $(TEST_DIR)/test_group_scheduler_concurrency.c
 TEST_BINS = $(patsubst $(TEST_DIR)/%.c,$(BIN_DIR)/%,$(TEST_FILES))
 
 # Example files
@@ -74,7 +78,7 @@ endif
 # Targets
 # ============================================================================
 
-.PHONY: all clean test examples help debug release format
+.PHONY: all clean test examples help debug release format tsan
 
 # Default target
 all: $(LIB_DIR)/$(LIB_NAME)
@@ -92,6 +96,7 @@ help:
 	@echo "  examples   - Build example programs"
 	@echo "  debug      - Build library in debug mode"
 	@echo "  release    - Build library in release mode"
+	@echo "  tsan       - Build and run tests with ThreadSanitizer (race detection)"
 	@echo "  format     - Format all C source files using clang-format"
 	@echo "  clean      - Remove all build artifacts"
 	@echo "  help       - Show this help message"
@@ -168,6 +173,16 @@ release:
 	@$(MAKE) MODE=release all
 
 # ============================================================================
+# ThreadSanitizer Build (Race Detection)
+# ============================================================================
+
+# Build and run tests with ThreadSanitizer enabled
+# Usage: make tsan
+tsan: CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
+tsan: LDFLAGS += -fsanitize=thread
+tsan: clean all test
+
+# ============================================================================
 # Directory Creation
 # ============================================================================
 
@@ -220,5 +235,6 @@ $(BIN_DIR)/test_config: $(TEST_DIR)/test_config.c $(INCLUDE_DIR)/hwfq.h $(TEST_D
 $(BIN_DIR)/test_group_scheduler: $(TEST_DIR)/test_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/test_fairness: $(TEST_DIR)/test_fairness.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_memory_pool.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/test_hierarchical: $(TEST_DIR)/test_hierarchical.c $(INCLUDE_DIR)/hwfq.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_group_scheduler_concurrency: $(TEST_DIR)/test_group_scheduler_concurrency.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/basic_config: $(EXAMPLE_DIR)/basic_config.c $(INCLUDE_DIR)/hwfq.h
 $(BIN_DIR)/custom_allocator: $(EXAMPLE_DIR)/custom_allocator.c $(INCLUDE_DIR)/hwfq.h

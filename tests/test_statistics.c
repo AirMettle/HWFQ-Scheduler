@@ -16,11 +16,18 @@
 #include "../src/hwfq_internal.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 // Global test counters
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
+
+// Portable millisecond sleep (avoids usleep which isn't in ISO C99)
+static void msleep(int ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
 
 // ============================================================================
 // Helper Functions
@@ -200,7 +207,7 @@ void test_wait_time_tracking(void) {
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed");
 
     // Wait a bit
-    usleep(10000);  // 10ms
+    msleep(10);  // 10ms
 
     // Dequeue
     hwfq_session_t work_out;

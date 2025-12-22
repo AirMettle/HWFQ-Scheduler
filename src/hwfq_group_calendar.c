@@ -99,6 +99,97 @@ uint32_t calculate_bin_index_from_finish_time(uint64_t finish_time, uint32_t gro
 }
 
 // ============================================================================
+// Bin Linked List Operations
+// ============================================================================
+
+// Compare two sessions: returns true if a should come before b in sorted list
+// Orders by finish_time ascending, then start_time ascending (FIFO tie-break)
+static inline bool session_less(const session_state_t *a, const session_state_t *b)
+{
+    if (a->finish_time != b->finish_time) {
+        return a->finish_time < b->finish_time;
+    }
+    return a->start_time < b->start_time;
+}
+
+// Insert session into bin's sorted doubly-linked list
+// Maintains ascending order by finish_time, then start_time
+static void bin_list_insert(group_scheduler_t *gs, uint32_t bin_index, session_state_t *session)
+{
+    session_state_t **head = &gs->bin_heads[bin_index];
+
+    // Initialize session's list pointers
+    session->bin_next = NULL;
+    session->bin_prev = NULL;
+
+    // Empty list case
+    if (*head == NULL) {
+        *head = session;
+        return;
+    }
+
+    // Find insertion point (maintain sorted order)
+    session_state_t *current = *head;
+    session_state_t *prev = NULL;
+
+    while (current != NULL && session_less(current, session)) {
+        prev = current;
+        current = current->bin_next;
+    }
+
+    // Insert at head
+    if (prev == NULL) {
+        session->bin_next = *head;
+        (*head)->bin_prev = session;
+        *head = session;
+    }
+    // Insert in middle or at end
+    else {
+        session->bin_prev = prev;
+        session->bin_next = current;
+        prev->bin_next = session;
+        if (current != NULL) {
+            current->bin_prev = session;
+        }
+    }
+}
+
+// Remove session from bin's doubly-linked list - O(1)
+static void bin_list_remove(group_scheduler_t *gs, uint32_t bin_index, session_state_t *session)
+{
+    session_state_t **head = &gs->bin_heads[bin_index];
+
+    // Update previous node or head
+    if (session->bin_prev != NULL) {
+        session->bin_prev->bin_next = session->bin_next;
+    } else {
+        // Session was head
+        *head = session->bin_next;
+    }
+
+    // Update next node
+    if (session->bin_next != NULL) {
+        session->bin_next->bin_prev = session->bin_prev;
+    }
+
+    // Clear session's pointers
+    session->bin_next = NULL;
+    session->bin_prev = NULL;
+}
+
+// Check if bin list is empty
+static inline bool bin_list_is_empty(group_scheduler_t *gs, uint32_t bin_index)
+{
+    return gs->bin_heads[bin_index] == NULL;
+}
+
+// Peek at minimum session in bin (list head) - O(1)
+static inline session_state_t *bin_list_peek(group_scheduler_t *gs, uint32_t bin_index)
+{
+    return gs->bin_heads[bin_index];
+}
+
+// ============================================================================
 // DTS-Calendar Queue Operations (Discrete Time Scheduler)
 // ============================================================================
 
@@ -121,15 +212,8 @@ int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
 
     session->bin_index = bin_index;
 
-    // Insert at head of linked list for this bin
-    session->next = gs->bin_sessions[bin_index];
-    session->prev = NULL;
-
-    if (gs->bin_sessions[bin_index] != NULL) {
-        gs->bin_sessions[bin_index]->prev = session;
-    }
-
-    gs->bin_sessions[bin_index] = session;
+    // Insert into bin's sorted linked list
+    bin_list_insert(gs, bin_index, session);
 
     // Update bitfields
     set_bin_bit(gs->bin_bitfield, bin_index);
@@ -157,14 +241,13 @@ int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
 }
 
 // Helper: Find eligible session with minimum finish time using bitfield-guided search
-// Returns NULL if no eligible sessions found, also updates min_start_time
+// Returns NULL if no eligible sessions found
+// O(B) complexity where B = number of non-empty bins
 static session_state_t *find_eligible_min_bitfield(group_scheduler_t *gs,
-                                                    uint64_t virtual_time,
-                                                    uint64_t *out_min_start_time)
+                                                    uint64_t virtual_time)
 {
     session_state_t *eligible_min = NULL;
     uint64_t min_eligible_finish = UINT64_MAX;
-    uint64_t min_start_time = UINT64_MAX;
 
     // Use hierarchical bitfield search: first find active group words,
     // then search bins within those groups
@@ -195,22 +278,16 @@ static session_state_t *find_eligible_min_bitfield(group_scheduler_t *gs,
 
                 if (bin_idx >= bin_end) break;
 
-                // Check all sessions in this bin
-                session_state_t *curr = gs->bin_sessions[bin_idx];
-                while (curr != NULL) {
-                    // Track minimum start time
-                    if (curr->start_time < min_start_time) {
-                        min_start_time = curr->start_time;
-                    }
+                // Check this bin's list head - O(1) peek
+                session_state_t *head = bin_list_peek(gs, bin_idx);
 
-                    // Check eligibility and find minimum finish time
-                    if (curr->start_time <= virtual_time) {
-                        if (curr->finish_time < min_eligible_finish) {
-                            min_eligible_finish = curr->finish_time;
-                            eligible_min = curr;
-                        }
+                // Only check list head - if head is eligible and has min finish_time, use it
+                // If head is not eligible, skip this bin (virtual time will be advanced)
+                if (head != NULL && head->start_time <= virtual_time) {
+                    if (head->finish_time < min_eligible_finish) {
+                        min_eligible_finish = head->finish_time;
+                        eligible_min = head;
                     }
-                    curr = curr->next;
                 }
 
                 // Clear this bit and continue
@@ -220,10 +297,6 @@ static session_state_t *find_eligible_min_bitfield(group_scheduler_t *gs,
             // Clear this group bit and continue
             group_bits &= ~(1U << group_bit);
         }
-    }
-
-    if (out_min_start_time != NULL) {
-        *out_min_start_time = min_start_time;
     }
 
     return eligible_min;
@@ -240,22 +313,19 @@ session_state_t *calendar_find_min_session(group_scheduler_t *gs)
     // 2. If no eligible sessions, advance virtual_time to min_start_time, then repeat
 
     uint64_t virtual_time = gs->virtual_time;
-    uint64_t min_start_time = UINT64_MAX;
 
-    // Use bitfield-guided search for eligible session
-    session_state_t *eligible_min = find_eligible_min_bitfield(gs, virtual_time, &min_start_time);
-
-    // Update cached min_start_time
-    gs->min_start_time = min_start_time;
+    // Use bitfield-guided search for eligible session - O(B) complexity
+    session_state_t *eligible_min = find_eligible_min_bitfield(gs, virtual_time);
 
     // If no eligible sessions found, advance virtual time and try again
-    if (eligible_min == NULL && min_start_time != UINT64_MAX) {
+    // Use cached min_start_time (maintained incrementally on insert/remove)
+    if (eligible_min == NULL && gs->min_start_time != UINT64_MAX) {
         // Advance virtual time to make at least one session eligible
-        gs->virtual_time = min_start_time;
-        virtual_time = min_start_time;
+        gs->virtual_time = gs->min_start_time;
+        virtual_time = gs->min_start_time;
 
-        // Re-search with updated virtual time
-        eligible_min = find_eligible_min_bitfield(gs, virtual_time, NULL);
+        // Re-search with updated virtual time - now at least one session is eligible
+        eligible_min = find_eligible_min_bitfield(gs, virtual_time);
     }
 
     // Update cache
@@ -277,20 +347,11 @@ int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
         return HWFQ_ERR_INTERNAL;
     }
 
-    // Remove from linked list
-    if (session->prev != NULL) {
-        session->prev->next = session->next;
-    } else {
-        // This was the head of the list
-        gs->bin_sessions[bin_index] = session->next;
-    }
-
-    if (session->next != NULL) {
-        session->next->prev = session->prev;
-    }
+    // Remove from bin's sorted linked list - O(1)
+    bin_list_remove(gs, bin_index, session);
 
     // Update bitfields if bin is now empty
-    if (gs->bin_sessions[bin_index] == NULL) {
+    if (bin_list_is_empty(gs, bin_index)) {
         clear_bin_bit(gs->bin_bitfield, bin_index);
 
         // Update group bitfield if entire 32-bin group is empty
@@ -314,12 +375,11 @@ int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
     }
 
     // Recalculate min_start_time if we removed the session with the minimum start time
-    // This is needed for correct virtual time updates
-    // Use bitfield-guided search instead of O(n) full scan
+    // Fixed: Only check list heads (O(B) where B = non-empty bins) instead of all sessions
     if (session->start_time == gs->min_start_time) {
         gs->min_start_time = UINT64_MAX;
 
-        // Use hierarchical bitfield search to find new min_start_time
+        // Use hierarchical bitfield search - only check list heads
         for (uint32_t gword = 0; gword < 32; gword++) {
             if (gs->group_bitfield[gword] == 0) {
                 continue;
@@ -338,12 +398,14 @@ int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
                         uint32_t bin_idx = word_idx * 32 + bit_pos;
 
                         if (bin_idx < gs->num_bins) {
-                            session_state_t *curr = gs->bin_sessions[bin_idx];
-                            while (curr != NULL) {
-                                if (curr->start_time < gs->min_start_time) {
-                                    gs->min_start_time = curr->start_time;
+                            // Check all sessions in bin for min_start_time
+                            // (list head has min finish_time, not necessarily min start_time)
+                            session_state_t *s = gs->bin_heads[bin_idx];
+                            while (s != NULL) {
+                                if (s->start_time < gs->min_start_time) {
+                                    gs->min_start_time = s->start_time;
                                 }
-                                curr = curr->next;
+                                s = s->bin_next;
                             }
                         }
                         bin_bits &= ~(1U << bit_pos);

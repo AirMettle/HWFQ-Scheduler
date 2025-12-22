@@ -121,9 +121,9 @@ void hwfq_memory_pool_free_session(hwfq_memory_pool_t *pool, session_state_t *se
         return;  // Already free
     }
 
-    // Clear the session's linked list pointers
-    session->next = NULL;
-    session->prev = NULL;
+    // Clear the session's list pointers (mark as not in a bin list)
+    session->bin_next = NULL;
+    session->bin_prev = NULL;
 
     // Free the slot in the trie
     hwfq_flow_trie_free(&pool->allocation_trie, index);

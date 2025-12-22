@@ -10,9 +10,17 @@
 // ============================================================================
 
 // Apply a 1/2 margin factor to effective rates for work-conserving behavior.
-// This allows virtual time to advance more by jumping to the next start time
-// rather than strictly incrementing by work, providing better scheduling margin.
-// The factor is applied uniformly to all entries, preserving fairness ratios.
+//
+// Design rationale (per PI Donpaul Stephens):
+// "It is probably easier to have the 'weight/rate' be a slight fraction (1/2)
+// of a nominal rate - the system would 'advance' more by jumping to the next
+// start time (as the virtual time incrementing by work won't advance as cleanly),
+// but for work-conserving systems works well in practice. Provides a bit of margin."
+//
+// This allows virtual time to advance more aggressively via the jump-ahead
+// mechanism (V = max(V + work, min_start_time)), improving work-conserving
+// behavior. The factor is applied uniformly to all entries, preserving
+// fairness ratios. Within a group/tenant, allocations are mostly "relative" units.
 #define HWFQ_RATE_MARGIN_SHIFT 1  // Divide by 2 (right shift by 1)
 
 // ============================================================================
@@ -86,14 +94,17 @@ static group_scheduler_t *group_scheduler_init_common(hwfq_scheduler_t *parent, 
         return NULL;
     }
     memset(gs->bin_bitfield, 0, sizeof(uint32_t) * gs->bin_bitfield_size);
-    gs->bin_sessions =
-        (session_state_t **)hwfq_alloc(parent, sizeof(session_state_t *) * gs->num_bins);
-    if (gs->bin_sessions == NULL) {
+
+    // Allocate bin list heads array (one pointer per bin)
+    gs->bin_heads = (session_state_t **)hwfq_alloc(parent, sizeof(session_state_t *) * gs->num_bins);
+    if (gs->bin_heads == NULL) {
         hwfq_free(parent, gs->bin_bitfield);
         hwfq_free(parent, gs);
         return NULL;
     }
-    memset(gs->bin_sessions, 0, sizeof(session_state_t *) * gs->num_bins);
+    // Initialize all bin heads to NULL (empty lists)
+    memset(gs->bin_heads, 0, sizeof(session_state_t *) * gs->num_bins);
+
     memset(gs->group_bitfield, 0, sizeof(gs->group_bitfield));
     gs->max_entries = max_entries;
     gs->virtual_time = 0;
@@ -104,6 +115,10 @@ static group_scheduler_t *group_scheduler_init_common(hwfq_scheduler_t *parent, 
     gs->allocated_rate_capacity = 0;
     gs->total_weight = 0;
     gs->configured_entries_head = NULL;
+
+    // Initialize thread safety lock
+    pthread_mutex_init(&gs->lock, NULL);
+
     return gs;
 }
 
@@ -120,7 +135,7 @@ group_scheduler_t *group_scheduler_init(hwfq_scheduler_t *parent, uint32_t num_g
     // Local array mode: allocate entries array directly
     gs->entries = (entry_config_t *)hwfq_alloc(parent, sizeof(entry_config_t) * max_entries);
     if (gs->entries == NULL) {
-        hwfq_free(parent, gs->bin_sessions);
+        hwfq_free(parent, gs->bin_heads);
         hwfq_free(parent, gs->bin_bitfield);
         hwfq_free(parent, gs);
         return NULL;
@@ -171,12 +186,17 @@ void group_scheduler_destroy(hwfq_scheduler_t *parent, group_scheduler_t *gs)
     if (gs->entries != NULL) {
         hwfq_free(parent, gs->entries);
     }
-    if (gs->bin_sessions != NULL) {
-        hwfq_free(parent, gs->bin_sessions);
+    // Free bin heads array (sessions themselves are freed by caller)
+    if (gs->bin_heads != NULL) {
+        hwfq_free(parent, gs->bin_heads);
     }
     if (gs->bin_bitfield != NULL) {
         hwfq_free(parent, gs->bin_bitfield);
     }
+
+    // Destroy thread safety lock
+    pthread_mutex_destroy(&gs->lock);
+
     hwfq_free(parent, gs);
 }
 
@@ -262,25 +282,33 @@ int group_scheduler_configure_entry(group_scheduler_t *gs, const group_entry_con
     if (gs == NULL || config == NULL) {
         return HWFQ_ERR_INVALID_ARG;
     }
+
+    pthread_mutex_lock(&gs->lock);
+
     if (config->entry_id >= gs->max_entries) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INVALID_ARG;
     }
     if (config->allocation.allocation_type != HWFQ_ALLOCATION_RATE &&
         config->allocation.allocation_type != HWFQ_ALLOCATION_WEIGHT) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INVALID_ARG;
     }
     if (config->allocation.allocation_type == HWFQ_ALLOCATION_RATE &&
         config->allocation.rate == 0) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INVALID_ARG;
     }
     if (config->allocation.allocation_type == HWFQ_ALLOCATION_WEIGHT &&
         config->allocation.weight == 0) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INVALID_ARG;
     }
 
     // Get or create entry (handles both local array and shared pool modes)
     entry_config_t *entry = group_scheduler_get_or_create_entry(gs, config->entry_id);
     if (entry == NULL) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_NO_MEMORY;
     }
 
@@ -301,6 +329,7 @@ int group_scheduler_configure_entry(group_scheduler_t *gs, const group_entry_con
                     gs->total_weight += entry->allocation.weight;
                 }
             }
+            pthread_mutex_unlock(&gs->lock);
             return HWFQ_ERR_OVERBOOKED;
         }
         gs->allocated_rate_capacity += config->allocation.rate;
@@ -318,6 +347,8 @@ int group_scheduler_configure_entry(group_scheduler_t *gs, const group_entry_con
         entry->configured = true;
     }
     recalculate_weight_based_rates(gs);
+
+    pthread_mutex_unlock(&gs->lock);
     return HWFQ_SUCCESS;
 }
 
@@ -326,13 +357,18 @@ int group_scheduler_remove_entry(group_scheduler_t *gs, group_entry_id_t entry_i
     if (gs == NULL) {
         return HWFQ_ERR_INVALID_ARG;
     }
+
+    pthread_mutex_lock(&gs->lock);
+
     if (entry_id >= gs->max_entries) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INVALID_ARG;
     }
 
     // Find entry using helper (handles both local array and shared pool modes)
     entry_config_t *entry = group_scheduler_find_entry(gs, entry_id);
     if (entry == NULL || !entry->configured) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
 
@@ -377,6 +413,8 @@ int group_scheduler_remove_entry(group_scheduler_t *gs, group_entry_id_t entry_i
     }
 
     recalculate_weight_based_rates(gs);
+
+    pthread_mutex_unlock(&gs->lock);
     return HWFQ_SUCCESS;
 }
 
@@ -390,19 +428,25 @@ int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, ui
     if (gs == NULL || work_size == 0) {
         return HWFQ_ERR_INVALID_ARG;
     }
+
+    pthread_mutex_lock(&gs->lock);
+
     if (entry_id >= gs->max_entries) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INVALID_ARG;
     }
 
     // Find entry using helper (handles both local array and shared pool modes)
     entry_config_t *entry = group_scheduler_find_entry(gs, entry_id);
     if (entry == NULL || !entry->configured) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
     uint64_t rate = (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE)
                         ? entry->calculated_rate
                         : calculate_effective_rate(gs, entry);
     if (rate == 0) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_INTERNAL;
     }
 
@@ -416,6 +460,7 @@ int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, ui
     }
     session_state_t *session = (session_state_t *)hwfq_alloc(gs->parent, sizeof(session_state_t));
     if (session == NULL) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_NO_MEMORY;
     }
     memset(session, 0, sizeof(session_state_t));
@@ -443,6 +488,7 @@ int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, ui
     int ret = calendar_insert_session(gs, session);
     if (ret != HWFQ_SUCCESS) {
         hwfq_free(gs->parent, session);
+        pthread_mutex_unlock(&gs->lock);
         return ret;
     }
     entry->last_finish_time = session->finish_time;
@@ -450,6 +496,8 @@ int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, ui
     if (session_out != NULL) {
         *session_out = session;
     }
+
+    pthread_mutex_unlock(&gs->lock);
     return HWFQ_SUCCESS;
 }
 
@@ -459,20 +507,31 @@ int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, ui
 
 session_state_t *group_scheduler_dequeue(group_scheduler_t *gs)
 {
-    if (gs == NULL || gs->active_session_count == 0) {
+    if (gs == NULL) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&gs->lock);
+
+    if (gs->active_session_count == 0) {
+        pthread_mutex_unlock(&gs->lock);
         return NULL;
     }
     // calendar_find_min_session returns the eligible session with minimum finish time
     // It also handles advancing virtual_time if no sessions are currently eligible
     session_state_t *session = calendar_find_min_session(gs);
     if (session == NULL) {
+        pthread_mutex_unlock(&gs->lock);
         return NULL;
     }
     int ret = calendar_remove_session(gs, session);
     if (ret != HWFQ_SUCCESS) {
+        pthread_mutex_unlock(&gs->lock);
         return NULL;
     }
     gs->active_session_count--;
+
+    pthread_mutex_unlock(&gs->lock);
     return session;
 }
 
@@ -485,12 +544,18 @@ int group_scheduler_remove_session(group_scheduler_t *gs, session_state_t *sessi
     if (gs == NULL || session == NULL) {
         return HWFQ_ERR_INVALID_ARG;
     }
+
+    pthread_mutex_lock(&gs->lock);
+
     int ret = calendar_remove_session(gs, session);
     if (ret != HWFQ_SUCCESS) {
+        pthread_mutex_unlock(&gs->lock);
         return ret;
     }
     gs->active_session_count--;
     hwfq_free(gs->parent, session);
+
+    pthread_mutex_unlock(&gs->lock);
     return HWFQ_SUCCESS;
 }
 
@@ -503,7 +568,71 @@ uint64_t group_scheduler_get_virtual_time(group_scheduler_t *gs)
     if (gs == NULL) {
         return 0;
     }
-    return gs->virtual_time;
+    pthread_mutex_lock(&gs->lock);
+    uint64_t vt = gs->virtual_time;
+    pthread_mutex_unlock(&gs->lock);
+    return vt;
+}
+
+// ============================================================================
+// Virtual Time Rebasing
+// ============================================================================
+
+// Rebase all virtual timestamps to prevent overflow.
+// This function shifts all timestamps down by a calculated offset, preserving
+// relative ordering. Must be called with exclusive access to the scheduler
+// (NOT thread-safe - caller must hold any external lock).
+//
+// The rebase is designed to be consistent: all timestamps are updated atomically
+// from the scheduler's logical perspective. No partial state is visible.
+void group_scheduler_rebase_if_needed(group_scheduler_t *gs)
+{
+    if (gs == NULL || gs->virtual_time < HWFQ_REBASE_THRESHOLD) {
+        return;  // No rebase needed
+    }
+
+    // Calculate offset: rebase to half of current virtual_time
+    // This gives maximum headroom before next rebase
+    uint64_t rebase_offset = gs->virtual_time / 2;
+
+    // Phase 1: Rebase scheduler-level cached values
+    gs->virtual_time -= rebase_offset;
+
+    if (gs->min_start_time != UINT64_MAX) {
+        gs->min_start_time = (gs->min_start_time >= rebase_offset)
+                                 ? (gs->min_start_time - rebase_offset)
+                                 : 0;
+    }
+
+    if (gs->min_finish_time != UINT64_MAX) {
+        gs->min_finish_time = (gs->min_finish_time >= rebase_offset)
+                                  ? (gs->min_finish_time - rebase_offset)
+                                  : 0;
+    }
+
+    // Phase 2: Rebase all sessions in calendar queue
+    // Iterate through all bins (most will be empty, skipped quickly)
+    for (uint32_t bin = 0; bin < gs->num_bins; bin++) {
+        session_state_t *session = gs->bin_heads[bin];
+        while (session != NULL) {
+            session->start_time = (session->start_time >= rebase_offset)
+                                      ? (session->start_time - rebase_offset)
+                                      : 0;
+            session->finish_time = (session->finish_time >= rebase_offset)
+                                       ? (session->finish_time - rebase_offset)
+                                       : 0;
+            session = session->bin_next;
+        }
+    }
+
+    // Phase 3: Rebase all entry last_finish_times
+    entry_config_t *entry = gs->configured_entries_head;
+    while (entry != NULL) {
+        entry->last_finish_time = (entry->last_finish_time >= rebase_offset)
+                                      ? (entry->last_finish_time - rebase_offset)
+                                      : 0;
+        entry = entry->next_configured;
+    }
 }
 
 void group_scheduler_update_virtual_time(group_scheduler_t *gs, uint64_t work_completed)
@@ -511,6 +640,8 @@ void group_scheduler_update_virtual_time(group_scheduler_t *gs, uint64_t work_co
     if (gs == NULL) {
         return;
     }
+
+    pthread_mutex_lock(&gs->lock);
 
     // In WF2Q+, virtual time advances based on the aggregate work done.
     // When servicing a backlogged system, V advances at rate equal to the
@@ -546,6 +677,11 @@ void group_scheduler_update_virtual_time(group_scheduler_t *gs, uint64_t work_co
 
     // V_WF2Q+(t + Δt) = max(V_WF2Q+(t) + Δt, min{S_i})
     gs->virtual_time = (normal_advance > min_start) ? normal_advance : min_start;
+
+    // Check if rebasing is needed to prevent overflow
+    group_scheduler_rebase_if_needed(gs);
+
+    pthread_mutex_unlock(&gs->lock);
 }
 
 // ============================================================================
@@ -578,12 +714,24 @@ uint64_t session_get_finish_time(const session_state_t *session)
 
 uint32_t group_scheduler_get_session_count(group_scheduler_t *gs)
 {
-    return (gs != NULL) ? gs->active_session_count : 0;
+    if (gs == NULL) {
+        return 0;
+    }
+    pthread_mutex_lock(&gs->lock);
+    uint32_t count = gs->active_session_count;
+    pthread_mutex_unlock(&gs->lock);
+    return count;
 }
 
 bool group_scheduler_is_empty(group_scheduler_t *gs)
 {
-    return (gs != NULL) ? (gs->active_session_count == 0) : true;
+    if (gs == NULL) {
+        return true;
+    }
+    pthread_mutex_lock(&gs->lock);
+    bool empty = (gs->active_session_count == 0);
+    pthread_mutex_unlock(&gs->lock);
+    return empty;
 }
 
 int group_scheduler_get_entry_rate(group_scheduler_t *gs, group_entry_id_t entry_id,
@@ -596,9 +744,12 @@ int group_scheduler_get_entry_rate(group_scheduler_t *gs, group_entry_id_t entry
         return HWFQ_ERR_INVALID_ARG;
     }
 
+    pthread_mutex_lock(&gs->lock);
+
     // Find entry using helper (handles both local array and shared pool modes)
     entry_config_t *entry = group_scheduler_find_entry(gs, entry_id);
     if (entry == NULL || !entry->configured) {
+        pthread_mutex_unlock(&gs->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
     if (entry->allocation.allocation_type == HWFQ_ALLOCATION_RATE) {
@@ -606,5 +757,6 @@ int group_scheduler_get_entry_rate(group_scheduler_t *gs, group_entry_id_t entry
     } else {
         *rate_out = calculate_effective_rate(gs, entry);
     }
+    pthread_mutex_unlock(&gs->lock);
     return HWFQ_SUCCESS;
 }

@@ -5,6 +5,7 @@
 #include "hwfq_internal.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 // ============================================================================
 // Time Precision Configuration
@@ -24,6 +25,12 @@
 // TIME_PRECISION_SHIFT = 20 provides ~1 microsecond precision with typical rates
 #define HWFQ_TIME_PRECISION_SHIFT 20
 #define HWFQ_TIME_SCALE_FACTOR (1ULL << HWFQ_TIME_PRECISION_SHIFT)
+
+// Virtual time rebasing threshold to prevent overflow.
+// At 10 GB/s with 4K blocks (~2.5M blocks/s), overflow would occur after ~79 days.
+// Rebasing triggers when virtual_time exceeds this threshold, shifting all timestamps
+// down to preserve relative ordering while preventing overflow.
+#define HWFQ_REBASE_THRESHOLD (UINT64_MAX / 2)
 
 // ============================================================================
 // Internal Data Structures for Group Scheduler
@@ -52,9 +59,9 @@ struct session_state_t {
     void *user_data;    // User-provided data pointer
     uint64_t work_size; // L (work size in work units)
 
-    // Linked list pointers (for sessions in same bin)
-    struct session_state_t *next;
-    struct session_state_t *prev;
+    // Doubly-linked list within bin (sorted by finish_time, then start_time)
+    struct session_state_t *bin_next;  // Next session in same bin
+    struct session_state_t *bin_prev;  // Previous session in same bin
 
     // Metadata
     uint64_t enqueue_time_ns; // When session was enqueued
@@ -87,6 +94,7 @@ typedef struct entry_config_t {
 
 } entry_config_t;
 
+
 // ============================================================================
 // Group Scheduler Structure
 // ============================================================================
@@ -103,9 +111,9 @@ struct group_scheduler_t {
     // Bitfield size = 32768 / 32 = 1024 uint32_t words
     uint32_t *bin_bitfield;
 
-    // Session lists for each bin
-    // bin_sessions[bin_index] points to head of linked list for that bin
-    session_state_t **bin_sessions;
+    // Linked list heads for each bin (sorted by finish_time, then start_time)
+    // bin_heads[bin_index] points to the first session in that bin (minimum finish_time)
+    session_state_t **bin_heads;
 
     // Hierarchical group bitfield (one bit per group of 32 bins)
     // For 32K bins, we have 1024 groups, needing 32 uint32_t words
@@ -161,6 +169,12 @@ struct group_scheduler_t {
     session_state_t *min_session;  // Cached pointer to minimum session
 
     // ========================================================================
+    // Thread Safety
+    // ========================================================================
+
+    pthread_mutex_t lock;  // Protects all scheduler state
+
+    // ========================================================================
     // Parent Context
     // ========================================================================
 
@@ -193,6 +207,10 @@ int calendar_insert_session(group_scheduler_t *gs, session_state_t *session);
 session_state_t *calendar_find_min_session(group_scheduler_t *gs);
 
 int calendar_remove_session(group_scheduler_t *gs, session_state_t *session);
+
+// Virtual time rebasing to prevent overflow
+// Shifts all timestamps down when virtual_time exceeds HWFQ_REBASE_THRESHOLD
+void group_scheduler_rebase_if_needed(group_scheduler_t *gs);
 
 // Bitfield operations
 void set_bin_bit(uint32_t *bitfield, uint32_t bin_index);
