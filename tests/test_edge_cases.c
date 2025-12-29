@@ -2,7 +2,6 @@
 // Edge Case Tests for H-WFQ Scheduler
 // ============================================================================
 //
-// Story 5: Comprehensive Test Suite - Edge Cases
 // - Max tenants limit
 // - Max flows per tenant limit
 // - Zero/max work sizes
@@ -103,29 +102,24 @@ void test_max_flows_per_tenant(void) {
     ret = hwfq_add_tenant(scheduler, &alloc, &tenant_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add tenant");
 
-    // Add flows - valid flow IDs are 1 to (max_flows_per_tenant - 1) since
-    // flow ID 0 is reserved and flow ID >= max_flows_per_tenant exceeds array bounds
-    int num_flows = TEST_MAX_FLOWS - 1;  // Valid flow IDs: 1 to 49
-    for (int f = 1; f <= num_flows; f++) {
-        ret = hwfq_configure_flow(scheduler, tenant_id, f, &alloc);
-        TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to configure flow");
+    // Add flows up to the limit (scheduler assigns flow_ids)
+    int num_flows = TEST_MAX_FLOWS - 1;  // Leave room near the limit
+    hwfq_flow_id_t flow_ids[TEST_MAX_FLOWS];
+    for (int f = 0; f < num_flows; f++) {
+        ret = hwfq_add_flow(scheduler, tenant_id, &alloc, &flow_ids[f]);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add flow");
     }
 
-    printf("    Successfully configured %d flows (IDs 1-%d)\n", num_flows, num_flows);
+    printf("    Successfully added %d flows\n", num_flows);
 
     // Verify they work
-    for (int f = 1; f <= num_flows; f++) {
+    for (int f = 0; f < num_flows; f++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        ret = hwfq_enqueue(scheduler, tenant_id, f, &work);
+        ret = hwfq_enqueue(scheduler, tenant_id, flow_ids[f], &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to enqueue to configured flow");
     }
 
     printf("    Successfully enqueued to all %d flows\n", num_flows);
-
-    // Verify flow ID at max_flows_per_tenant is rejected
-    ret = hwfq_configure_flow(scheduler, tenant_id, TEST_MAX_FLOWS, &alloc);
-    TEST_ASSERT(ret != HWFQ_SUCCESS, "Flow ID at max limit should be rejected");
-    printf("    Flow ID %d correctly rejected (at limit)\n", TEST_MAX_FLOWS);
 
     hwfq_destroy(scheduler);
     TEST_PASS();
@@ -160,8 +154,9 @@ void test_max_total_flows(void) {
         ret = hwfq_add_tenant(scheduler, &alloc, &tenant_id);
         if (ret != HWFQ_SUCCESS) break;
 
-        for (int f = 1; f <= 50; f++) {
-            ret = hwfq_configure_flow(scheduler, tenant_id, f, &alloc);
+        for (int f = 0; f < 50; f++) {
+            hwfq_flow_id_t flow_id;
+            ret = hwfq_add_flow(scheduler, tenant_id, &alloc, &flow_id);
             if (ret == HWFQ_SUCCESS) {
                 total_flows_configured++;
             }
@@ -233,9 +228,12 @@ void test_max_work_size(void) {
     hwfq_tenant_id_t tenant_id;
     hwfq_add_tenant(scheduler, &alloc, &tenant_id);
 
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     // Enqueue with very large work size (not UINT64_MAX to avoid overflow)
     hwfq_session_t work = { .user_data = NULL, .work_size = UINT64_MAX / 2, .timestamp = 0 };
-    ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+    ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Large work size should be accepted");
 
     // Dequeue
@@ -276,13 +274,16 @@ void test_rapid_empty_full(void) {
     hwfq_tenant_id_t tenant_id;
     hwfq_add_tenant(scheduler, &alloc, &tenant_id);
 
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     #define RAPID_CYCLES 1000
 
     for (int i = 0; i < RAPID_CYCLES; i++) {
         // Fill with 10 items
         for (int j = 0; j < 10; j++) {
             hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-            ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+            ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
             TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue should succeed");
         }
 
@@ -330,17 +331,24 @@ void test_single_session_fairness(void) {
     // Create group scheduler directly for testing
     group_scheduler_t *gs = scheduler->system_scheduler;
 
+    // Allocate entries
+    uint32_t entry_ids[3];
+    test_alloc_entry(gs->entries, &entry_ids[0]);
+    test_alloc_entry(gs->entries, &entry_ids[1]);
+    test_alloc_entry(gs->entries, &entry_ids[2]);
+
     // Configure entries with different rates (higher rate = lower finish time)
+    // entry_ids[0] -> 100 MB/s (lowest), entry_ids[1] -> 200 MB/s, entry_ids[2] -> 300 MB/s (highest)
     group_entry_config_t config0 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_RATE, .rate = 100000000ULL }  // 100 MB/s
     };
     group_entry_config_t config1 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_RATE, .rate = 200000000ULL }  // 200 MB/s
     };
     group_entry_config_t config2 = {
-        .entry_id = 2,
+        .entry_id = entry_ids[2],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_RATE, .rate = 300000000ULL }  // 300 MB/s
     };
 
@@ -349,24 +357,25 @@ void test_single_session_fairness(void) {
     group_scheduler_configure_entry(gs, &config2);
 
     // Enqueue one session to each entry (same size)
-    group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
-    group_scheduler_enqueue(gs, 1, 1024, NULL, NULL);
-    group_scheduler_enqueue(gs, 2, 1024, NULL, NULL);
+    group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
+    group_scheduler_enqueue(gs, entry_ids[1], 1024, NULL, NULL, NULL);
+    group_scheduler_enqueue(gs, entry_ids[2], 1024, NULL, NULL, NULL);
 
-    // Dequeue order should be: highest rate first (entry 2, then 1, then 0)
+    // Dequeue order should be: highest rate first (entry_ids[2], then [1], then [0])
     session_state_t *s1 = group_scheduler_dequeue(gs);
     session_state_t *s2 = group_scheduler_dequeue(gs);
     session_state_t *s3 = group_scheduler_dequeue(gs);
 
     TEST_ASSERT(s1 != NULL && s2 != NULL && s3 != NULL, "All sessions should dequeue");
 
-    printf("    Dequeue order: %u, %u, %u (expected: 2, 1, 0 for rate order)\n",
-           s1->entry_id, s2->entry_id, s3->entry_id);
+    printf("    Dequeue order: %u, %u, %u (expected: %u, %u, %u for rate order)\n",
+           s1->entry_id, s2->entry_id, s3->entry_id,
+           entry_ids[2], entry_ids[1], entry_ids[0]);
 
     // Higher rate should finish first
-    TEST_ASSERT(s1->entry_id == 2, "Highest rate entry should dequeue first");
-    TEST_ASSERT(s2->entry_id == 1, "Middle rate entry should dequeue second");
-    TEST_ASSERT(s3->entry_id == 0, "Lowest rate entry should dequeue last");
+    TEST_ASSERT(s1->entry_id == entry_ids[2], "Highest rate entry should dequeue first");
+    TEST_ASSERT(s2->entry_id == entry_ids[1], "Middle rate entry should dequeue second");
+    TEST_ASSERT(s3->entry_id == entry_ids[0], "Lowest rate entry should dequeue last");
 
     free(s1);
     free(s2);

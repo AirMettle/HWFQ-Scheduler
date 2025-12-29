@@ -27,55 +27,36 @@
 //
 // ============================================================================
 
-// Maximum supported flows (can be configured lower at runtime)
-#define HWFQ_TRIE_MAX_FLOWS (64 * 1024 * 1024)  // 64M maximum
-
-// Trie structure for flow ID allocation tracking
 typedef struct {
-    // Hierarchical bitfields
-    // Upper levels: 1 = has free slots below, 0 = fully allocated
-    uint64_t level2;              // Top level (1 word, 64 bits)
-    uint64_t *level1;             // Mid level (dynamically sized)
-    uint64_t *level0;             // Base level (dynamically sized)
-    uint64_t *leaf;               // Leaf level (1 bit per flow, 0=free, 1=allocated)
-
-    // Sizes for each level (computed at init based on max_flows)
-    uint32_t level1_size;         // Number of uint64_t words in level1
-    uint32_t level0_size;         // Number of uint64_t words in level0
-    uint32_t leaf_size;           // Number of uint64_t words in leaf
-
-    // Configuration
-    uint32_t max_flows;           // Maximum number of flows supported
-    uint32_t allocated_count;     // Current number of allocated flow IDs
-
-    // Allocation hint for cache locality (prefer lower IDs)
-    uint32_t alloc_hint;          // Last successful allocation position
+    uint64_t level2;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t *leaf;
+    uint32_t level1_size;
+    uint32_t level0_size;
+    uint32_t leaf_size;
+    uint32_t max_flows;
+    uint32_t allocated_count;
+    uint32_t alloc_hint;
 } hwfq_flow_trie_t;
-
-// ============================================================================
-// Trie Lifecycle Functions
-// ============================================================================
 
 // Initialize a flow trie for the given maximum number of flows
 //
 // trie - Pointer to trie structure to initialize
 // max_flows - Maximum number of flows to support (must be > 0)
 // alloc_fn - Memory allocator function (NULL = use malloc)
+// free_fn - Memory deallocator function (NULL = use free)
 // returns - 0 on success, negative error code on failure
 //
 // NOTE: Flow ID 0 is automatically reserved and cannot be allocated.
 int hwfq_flow_trie_init(hwfq_flow_trie_t *trie, uint32_t max_flows,
-                        void *(*alloc_fn)(size_t));
+                        void *(*alloc_fn)(size_t), void (*free_fn)(void *));
 
 // Destroy a flow trie and free all memory
 //
 // trie - Pointer to trie structure to destroy
 // free_fn - Memory deallocator function (NULL = use free)
 void hwfq_flow_trie_destroy(hwfq_flow_trie_t *trie, void (*free_fn)(void *));
-
-// ============================================================================
-// Allocation Functions
-// ============================================================================
 
 // Allocate a new flow ID
 //
@@ -97,10 +78,6 @@ int hwfq_flow_trie_alloc(hwfq_flow_trie_t *trie, uint32_t *flow_id_out);
 // NOTE: Freeing flow ID 0 is a no-op (it's permanently reserved).
 //       Freeing an already-free ID is safe but wasteful.
 void hwfq_flow_trie_free(hwfq_flow_trie_t *trie, uint32_t flow_id);
-
-// ============================================================================
-// Query Functions
-// ============================================================================
 
 // Check if a flow ID is currently allocated
 //

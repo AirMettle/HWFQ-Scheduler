@@ -27,8 +27,7 @@ SRC_FILES = $(SRC_DIR)/hwfq_config.c \
             $(SRC_DIR)/hwfq_group_scheduler.c \
             $(SRC_DIR)/hwfq_group_calendar.c \
             $(SRC_DIR)/hwfq_flow_trie.c \
-            $(SRC_DIR)/hwfq_memory_pool.c \
-            $(SRC_DIR)/hwfq_entry_pool.c \
+            $(SRC_DIR)/hwfq_chunked_entries.c \
             $(SRC_DIR)/hwfq_scheduler.c
 
 # Object files
@@ -48,12 +47,16 @@ TEST_FILES = $(TEST_DIR)/test_config.c \
              $(TEST_DIR)/test_skew_progressive.c \
              $(TEST_DIR)/test_data_export.c \
              $(TEST_DIR)/test_concurrency.c \
-             $(TEST_DIR)/test_group_scheduler_concurrency.c
+             $(TEST_DIR)/test_group_scheduler_concurrency.c \
+             $(TEST_DIR)/test_flow_trie.c \
+             $(TEST_DIR)/test_chunked_entries.c \
+             $(TEST_DIR)/test_calendar.c
 TEST_BINS = $(patsubst $(TEST_DIR)/%.c,$(BIN_DIR)/%,$(TEST_FILES))
 
 # Example files
 EXAMPLE_FILES = $(EXAMPLE_DIR)/basic_config.c \
-                $(EXAMPLE_DIR)/custom_allocator.c
+                $(EXAMPLE_DIR)/custom_allocator.c \
+                $(EXAMPLE_DIR)/async_worker.c
 EXAMPLE_BINS = $(patsubst $(EXAMPLE_DIR)/%.c,$(BIN_DIR)/%,$(EXAMPLE_FILES))
 
 # Compiler flags
@@ -78,7 +81,7 @@ endif
 # Targets
 # ============================================================================
 
-.PHONY: all clean test examples help debug release format tsan
+.PHONY: all clean test examples help debug release format tsan asan
 
 # Default target
 all: $(LIB_DIR)/$(LIB_NAME)
@@ -97,6 +100,7 @@ help:
 	@echo "  debug      - Build library in debug mode"
 	@echo "  release    - Build library in release mode"
 	@echo "  tsan       - Build and run tests with ThreadSanitizer (race detection)"
+	@echo "  asan       - Build and run tests with AddressSanitizer (memory leak detection)"
 	@echo "  format     - Format all C source files using clang-format"
 	@echo "  clean      - Remove all build artifacts"
 	@echo "  help       - Show this help message"
@@ -140,10 +144,17 @@ test: $(LIB_DIR)/$(LIB_NAME) $(TEST_BINS)
 	@echo ""
 	@echo "All tests passed!"
 
+# Test common object file
+TEST_COMMON_OBJ = $(OBJ_DIR)/test_common.o
+
+$(OBJ_DIR)/test_common.o: $(TEST_DIR)/test_common.c $(TEST_DIR)/test_common.h | $(OBJ_DIR)
+	@echo "Compiling: $<"
+	$(CC) $(CFLAGS) -I$(TEST_DIR) -c $< -o $@
+
 # Build test binaries
-$(BIN_DIR)/test_%: $(TEST_DIR)/test_%.c $(LIB_DIR)/$(LIB_NAME) | $(BIN_DIR)
+$(BIN_DIR)/test_%: $(TEST_DIR)/test_%.c $(LIB_DIR)/$(LIB_NAME) $(TEST_COMMON_OBJ) | $(BIN_DIR)
 	@echo "Building test: $@"
-	$(CC) $(CFLAGS) -I$(TEST_DIR) $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(TEST_DIR) $< $(TEST_COMMON_OBJ) -o $@ $(LDFLAGS)
 
 # ============================================================================
 # Examples
@@ -181,6 +192,23 @@ release:
 tsan: CFLAGS += -fsanitize=thread -fno-omit-frame-pointer
 tsan: LDFLAGS += -fsanitize=thread
 tsan: clean all test
+
+# ============================================================================
+# AddressSanitizer Build (Memory Leak Detection)
+# ============================================================================
+
+# Build and run tests with AddressSanitizer enabled
+# Detects: buffer overflows, use-after-free, double-free
+# On Linux, also enables leak sanitizer for memory leak detection
+# Usage: make asan
+ASAN_FLAGS = -fsanitize=address -fno-omit-frame-pointer
+ifeq ($(shell uname),Linux)
+    ASAN_FLAGS += -fsanitize=leak
+endif
+
+asan: CFLAGS += $(ASAN_FLAGS)
+asan: LDFLAGS += $(ASAN_FLAGS)
+asan: clean all test
 
 # ============================================================================
 # Directory Creation
@@ -222,19 +250,22 @@ clean:
 # ============================================================================
 
 # Header dependencies
-$(OBJ_DIR)/hwfq_config.o: $(SRC_DIR)/hwfq_config.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h $(SRC_DIR)/hwfq_memory_pool.h
+$(OBJ_DIR)/hwfq_config.o: $(SRC_DIR)/hwfq_config.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h
 $(OBJ_DIR)/hwfq_memory.o: $(SRC_DIR)/hwfq_memory.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h
-$(OBJ_DIR)/hwfq_group_scheduler.o: $(SRC_DIR)/hwfq_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
-$(OBJ_DIR)/hwfq_group_calendar.o: $(SRC_DIR)/hwfq_group_calendar.c $(INCLUDE_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
+$(OBJ_DIR)/hwfq_group_scheduler.o: $(SRC_DIR)/hwfq_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
+$(OBJ_DIR)/hwfq_group_calendar.o: $(SRC_DIR)/hwfq_group_calendar.c $(SRC_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
 $(OBJ_DIR)/hwfq_flow_trie.o: $(SRC_DIR)/hwfq_flow_trie.c $(SRC_DIR)/hwfq_flow_trie.h $(INCLUDE_DIR)/hwfq.h
-$(OBJ_DIR)/hwfq_memory_pool.o: $(SRC_DIR)/hwfq_memory_pool.c $(SRC_DIR)/hwfq_memory_pool.h $(SRC_DIR)/hwfq_flow_trie.h
-$(OBJ_DIR)/hwfq_entry_pool.o: $(SRC_DIR)/hwfq_entry_pool.c $(SRC_DIR)/hwfq_entry_pool.h $(SRC_DIR)/hwfq_flow_trie.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
-$(OBJ_DIR)/hwfq_scheduler.o: $(SRC_DIR)/hwfq_scheduler.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(SRC_DIR)/hwfq_memory_pool.h
+$(OBJ_DIR)/hwfq_chunked_entries.o: $(SRC_DIR)/hwfq_chunked_entries.c $(SRC_DIR)/hwfq_chunked_entries.h $(SRC_DIR)/hwfq_group_scheduler_internal.h
+$(OBJ_DIR)/hwfq_scheduler.o: $(SRC_DIR)/hwfq_scheduler.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_internal.h $(SRC_DIR)/hwfq_group_scheduler.h
 
 $(BIN_DIR)/test_config: $(TEST_DIR)/test_config.c $(INCLUDE_DIR)/hwfq.h $(TEST_DIR)/test_common.h
-$(BIN_DIR)/test_group_scheduler: $(TEST_DIR)/test_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
-$(BIN_DIR)/test_fairness: $(TEST_DIR)/test_fairness.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_memory_pool.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_group_scheduler: $(TEST_DIR)/test_group_scheduler.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_fairness: $(TEST_DIR)/test_fairness.c $(INCLUDE_DIR)/hwfq.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/test_hierarchical: $(TEST_DIR)/test_hierarchical.c $(INCLUDE_DIR)/hwfq.h $(TEST_DIR)/test_common.h
-$(BIN_DIR)/test_group_scheduler_concurrency: $(TEST_DIR)/test_group_scheduler_concurrency.c $(INCLUDE_DIR)/hwfq.h $(INCLUDE_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_group_scheduler_concurrency: $(TEST_DIR)/test_group_scheduler_concurrency.c $(INCLUDE_DIR)/hwfq.h $(SRC_DIR)/hwfq_group_scheduler.h $(TEST_DIR)/test_common.h
 $(BIN_DIR)/basic_config: $(EXAMPLE_DIR)/basic_config.c $(INCLUDE_DIR)/hwfq.h
 $(BIN_DIR)/custom_allocator: $(EXAMPLE_DIR)/custom_allocator.c $(INCLUDE_DIR)/hwfq.h
+$(BIN_DIR)/async_worker: $(EXAMPLE_DIR)/async_worker.c $(INCLUDE_DIR)/hwfq.h
+$(BIN_DIR)/test_flow_trie: $(TEST_DIR)/test_flow_trie.c $(SRC_DIR)/hwfq_flow_trie.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_chunked_entries: $(TEST_DIR)/test_chunked_entries.c $(SRC_DIR)/hwfq_chunked_entries.h $(TEST_DIR)/test_common.h
+$(BIN_DIR)/test_calendar: $(TEST_DIR)/test_calendar.c $(SRC_DIR)/hwfq_group_scheduler_internal.h $(TEST_DIR)/test_common.h

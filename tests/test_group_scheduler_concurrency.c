@@ -19,7 +19,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-// Test result tracking
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
 
@@ -32,51 +31,6 @@ static int g_tests_failed = 0;
 #define NUM_ENTRIES 4
 
 // ============================================================================
-// Portable Barrier (macOS compatibility)
-// ============================================================================
-
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int count;
-    int target;
-    int generation;
-} portable_barrier_t;
-
-static int barrier_init(portable_barrier_t *b, int count) {
-    b->count = 0;
-    b->target = count;
-    b->generation = 0;
-    if (pthread_mutex_init(&b->mutex, NULL) != 0) return -1;
-    if (pthread_cond_init(&b->cond, NULL) != 0) {
-        pthread_mutex_destroy(&b->mutex);
-        return -1;
-    }
-    return 0;
-}
-
-static void barrier_destroy(portable_barrier_t *b) {
-    pthread_mutex_destroy(&b->mutex);
-    pthread_cond_destroy(&b->cond);
-}
-
-static void barrier_wait(portable_barrier_t *b) {
-    pthread_mutex_lock(&b->mutex);
-    int gen = b->generation;
-    b->count++;
-    if (b->count >= b->target) {
-        b->count = 0;
-        b->generation++;
-        pthread_cond_broadcast(&b->cond);
-    } else {
-        while (gen == b->generation) {
-            pthread_cond_wait(&b->cond, &b->mutex);
-        }
-    }
-    pthread_mutex_unlock(&b->mutex);
-}
-
-// ============================================================================
 // Test State
 // ============================================================================
 
@@ -85,13 +39,11 @@ typedef struct {
     group_scheduler_t *gs;
     portable_barrier_t start_barrier;
 
-    // Atomic counters
     atomic_uint_fast64_t enqueue_count;
     atomic_uint_fast64_t dequeue_count;
     atomic_uint_fast64_t configure_count;
     atomic_uint_fast64_t error_count;
 
-    // Control (atomic for TSAN compliance)
     atomic_int stop_flag;
 } test_state_t;
 
@@ -101,9 +53,18 @@ typedef struct {
     int ops;
 } thread_arg_t;
 
-// ============================================================================
-// Helper: Create minimal parent scheduler for memory allocation
-// ============================================================================
+static uint32_t g_entry_ids[NUM_ENTRIES];
+
+static void configure_test_entries(group_scheduler_t *gs) {
+    for (int i = 0; i < NUM_ENTRIES; i++) {
+        test_alloc_entry(gs->entries, &g_entry_ids[i]);
+        group_entry_config_t cfg = {
+            .entry_id = g_entry_ids[i],
+            .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
+        };
+        group_scheduler_configure_entry(gs, &cfg);
+    }
+}
 
 static hwfq_scheduler_t *create_test_parent(void) {
     hwfq_config_t config = {
@@ -130,15 +91,15 @@ static void *enqueue_thread_func(void *arg) {
     int thread_id = targ->thread_id;
     int ops = targ->ops;
 
-    barrier_wait(&state->start_barrier);
+    portable_barrier_wait(&state->start_barrier);
 
     for (int i = 0; i < ops; i++) {
-        group_entry_id_t entry_id = (group_entry_id_t)(thread_id % NUM_ENTRIES);
+        group_entry_id_t entry_id = g_entry_ids[thread_id % NUM_ENTRIES];
         uint64_t work_size = 1024 + (i % 4096);
         void *user_data = (void *)(uintptr_t)((thread_id << 16) | i);
         session_state_t *session = NULL;
 
-        int ret = group_scheduler_enqueue(state->gs, entry_id, work_size, user_data, &session);
+        int ret = group_scheduler_enqueue(state->gs, entry_id, work_size, user_data, NULL, &session);
         if (ret == HWFQ_SUCCESS) {
             atomic_fetch_add(&state->enqueue_count, 1);
         } else {
@@ -156,19 +117,13 @@ void test_gs_concurrent_enqueue(void) {
     state.parent = create_test_parent();
     TEST_ASSERT(state.parent != NULL, "Failed to create parent scheduler");
 
-    state.gs = group_scheduler_init(state.parent, 16, 2048, 1000000000ULL, 1000);
+    state.gs = test_create_group_scheduler(state.parent, 16, 2048, 1000000000ULL, 1000);
     TEST_ASSERT(state.gs != NULL, "Failed to create group scheduler");
 
     // Configure entries
-    for (int i = 0; i < NUM_ENTRIES; i++) {
-        group_entry_config_t cfg = {
-            .entry_id = (group_entry_id_t)i,
-            .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
-        };
-        group_scheduler_configure_entry(state.gs, &cfg);
-    }
+    configure_test_entries(state.gs);
 
-    barrier_init(&state.start_barrier, NUM_THREADS);
+    portable_barrier_init(&state.start_barrier, NUM_THREADS);
     atomic_store(&state.enqueue_count, 0);
     atomic_store(&state.error_count, 0);
 
@@ -196,14 +151,13 @@ void test_gs_concurrent_enqueue(void) {
     TEST_ASSERT(errors == 0, "Enqueue errors occurred");
     TEST_ASSERT(session_count == enqueued, "Session count mismatch");
 
-    // Drain and free sessions
     session_state_t *s;
     while ((s = group_scheduler_dequeue(state.gs)) != NULL) {
-        free(s);
+        hwfq_free(state.parent, s);
     }
 
-    barrier_destroy(&state.start_barrier);
-    group_scheduler_destroy(state.parent, state.gs);
+    portable_barrier_destroy(&state.start_barrier);
+    test_destroy_group_scheduler(state.parent, state.gs);
     hwfq_destroy(state.parent);
     TEST_PASS();
 }
@@ -216,24 +170,22 @@ static void *dequeue_thread_func(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
     test_state_t *state = targ->state;
 
-    barrier_wait(&state->start_barrier);
+    portable_barrier_wait(&state->start_barrier);
 
     while (!atomic_load(&state->stop_flag)) {
         session_state_t *session = group_scheduler_dequeue(state->gs);
         if (session != NULL) {
             atomic_fetch_add(&state->dequeue_count, 1);
-            free(session);
+            hwfq_free(state->parent, session);
         } else {
-            // Brief spin
             for (volatile int j = 0; j < 100; j++) { }
         }
     }
 
-    // Final drain after stop
     session_state_t *session;
     while ((session = group_scheduler_dequeue(state->gs)) != NULL) {
         atomic_fetch_add(&state->dequeue_count, 1);
-        free(session);
+        hwfq_free(state->parent, session);
     }
 
     return NULL;
@@ -247,25 +199,19 @@ void test_gs_concurrent_dequeue(void) {
     state.parent = create_test_parent();
     TEST_ASSERT(state.parent != NULL, "Failed to create parent scheduler");
 
-    state.gs = group_scheduler_init(state.parent, 16, 2048, 1000000000ULL, 1000);
+    state.gs = test_create_group_scheduler(state.parent, 16, 2048, 1000000000ULL, 1000);
     TEST_ASSERT(state.gs != NULL, "Failed to create group scheduler");
 
-    // Configure entry
-    group_entry_config_t cfg = {
-        .entry_id = 0,
-        .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
-    };
-    group_scheduler_configure_entry(state.gs, &cfg);
+    configure_test_entries(state.gs);
 
-    // Pre-fill
     for (int i = 0; i < prefill; i++) {
         session_state_t *session;
-        int ret = group_scheduler_enqueue(state.gs, 0, 1024, (void *)(uintptr_t)i, &session);
+        int ret = group_scheduler_enqueue(state.gs, g_entry_ids[0], 1024, (void *)(uintptr_t)i, NULL, &session);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Pre-fill enqueue failed");
     }
     printf("      Pre-filled %d items\n", prefill);
 
-    barrier_init(&state.start_barrier, NUM_THREADS);
+    portable_barrier_init(&state.start_barrier, NUM_THREADS);
     atomic_store(&state.dequeue_count, 0);
     atomic_store(&state.stop_flag, 0);
 
@@ -278,8 +224,7 @@ void test_gs_concurrent_dequeue(void) {
         pthread_create(&threads[i], NULL, dequeue_thread_func, &args[i]);
     }
 
-    // Let threads run briefly
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; // 100ms
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
     nanosleep(&ts, NULL);
 
     atomic_store(&state.stop_flag, 1);
@@ -294,8 +239,8 @@ void test_gs_concurrent_dequeue(void) {
     TEST_ASSERT(dequeued == (uint64_t)prefill, "Dequeue count mismatch");
     TEST_ASSERT(group_scheduler_is_empty(state.gs), "Scheduler should be empty");
 
-    barrier_destroy(&state.start_barrier);
-    group_scheduler_destroy(state.parent, state.gs);
+    portable_barrier_destroy(&state.start_barrier);
+    test_destroy_group_scheduler(state.parent, state.gs);
     hwfq_destroy(state.parent);
     TEST_PASS();
 }
@@ -310,24 +255,22 @@ static void *mixed_thread_func(void *arg) {
     int thread_id = targ->thread_id;
     int ops = targ->ops;
 
-    barrier_wait(&state->start_barrier);
+    portable_barrier_wait(&state->start_barrier);
 
     for (int i = 0; i < ops; i++) {
         if (i % 2 == 0) {
-            // Enqueue
-            group_entry_id_t entry_id = (group_entry_id_t)(thread_id % NUM_ENTRIES);
+            group_entry_id_t entry_id = g_entry_ids[thread_id % NUM_ENTRIES];
             session_state_t *session;
             int ret = group_scheduler_enqueue(state->gs, entry_id, 1024,
-                                              (void *)(uintptr_t)((thread_id << 16) | i), &session);
+                                              (void *)(uintptr_t)((thread_id << 16) | i), NULL, &session);
             if (ret == HWFQ_SUCCESS) {
                 atomic_fetch_add(&state->enqueue_count, 1);
             }
         } else {
-            // Dequeue
             session_state_t *session = group_scheduler_dequeue(state->gs);
             if (session != NULL) {
                 atomic_fetch_add(&state->dequeue_count, 1);
-                free(session);
+                hwfq_free(state->parent, session);
             }
         }
     }
@@ -342,19 +285,13 @@ void test_gs_mixed_enqueue_dequeue(void) {
     state.parent = create_test_parent();
     TEST_ASSERT(state.parent != NULL, "Failed to create parent scheduler");
 
-    state.gs = group_scheduler_init(state.parent, 16, 2048, 1000000000ULL, 1000);
+    state.gs = test_create_group_scheduler(state.parent, 16, 2048, 1000000000ULL, 1000);
     TEST_ASSERT(state.gs != NULL, "Failed to create group scheduler");
 
     // Configure entries
-    for (int i = 0; i < NUM_ENTRIES; i++) {
-        group_entry_config_t cfg = {
-            .entry_id = (group_entry_id_t)i,
-            .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
-        };
-        group_scheduler_configure_entry(state.gs, &cfg);
-    }
+    configure_test_entries(state.gs);
 
-    barrier_init(&state.start_barrier, NUM_THREADS);
+    portable_barrier_init(&state.start_barrier, NUM_THREADS);
     atomic_store(&state.enqueue_count, 0);
     atomic_store(&state.dequeue_count, 0);
 
@@ -375,12 +312,11 @@ void test_gs_mixed_enqueue_dequeue(void) {
     uint64_t enqueued = atomic_load(&state.enqueue_count);
     uint64_t dequeued = atomic_load(&state.dequeue_count);
 
-    // Drain remaining
     uint64_t remaining = 0;
     session_state_t *s;
     while ((s = group_scheduler_dequeue(state.gs)) != NULL) {
         remaining++;
-        free(s);
+        hwfq_free(state.parent, s);
     }
 
     printf("      Enqueued: %lu, Dequeued: %lu, Remaining: %lu\n",
@@ -388,8 +324,8 @@ void test_gs_mixed_enqueue_dequeue(void) {
 
     TEST_ASSERT(enqueued == dequeued + remaining, "Accounting mismatch");
 
-    barrier_destroy(&state.start_barrier);
-    group_scheduler_destroy(state.parent, state.gs);
+    portable_barrier_destroy(&state.start_barrier);
+    test_destroy_group_scheduler(state.parent, state.gs);
     hwfq_destroy(state.parent);
     TEST_PASS();
 }
@@ -404,10 +340,10 @@ static void *configure_thread_func(void *arg) {
     int thread_id = targ->thread_id;
     int ops = targ->ops;
 
-    barrier_wait(&state->start_barrier);
+    portable_barrier_wait(&state->start_barrier);
 
     for (int i = 0; i < ops; i++) {
-        group_entry_id_t entry_id = (group_entry_id_t)((thread_id + i) % NUM_ENTRIES);
+        group_entry_id_t entry_id = g_entry_ids[(thread_id + i) % NUM_ENTRIES];
         group_entry_config_t cfg = {
             .entry_id = entry_id,
             .allocation = {
@@ -434,19 +370,12 @@ void test_gs_concurrent_configure_entry(void) {
     state.parent = create_test_parent();
     TEST_ASSERT(state.parent != NULL, "Failed to create parent scheduler");
 
-    state.gs = group_scheduler_init(state.parent, 16, 2048, 1000000000ULL, 1000);
+    state.gs = test_create_group_scheduler(state.parent, 16, 2048, 1000000000ULL, 1000);
     TEST_ASSERT(state.gs != NULL, "Failed to create group scheduler");
 
-    // Initial configuration
-    for (int i = 0; i < NUM_ENTRIES; i++) {
-        group_entry_config_t cfg = {
-            .entry_id = (group_entry_id_t)i,
-            .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
-        };
-        group_scheduler_configure_entry(state.gs, &cfg);
-    }
+    configure_test_entries(state.gs);
 
-    barrier_init(&state.start_barrier, NUM_THREADS);
+    portable_barrier_init(&state.start_barrier, NUM_THREADS);
     atomic_store(&state.configure_count, 0);
     atomic_store(&state.error_count, 0);
 
@@ -472,8 +401,8 @@ void test_gs_concurrent_configure_entry(void) {
 
     TEST_ASSERT(errors == 0, "Configuration errors occurred");
 
-    barrier_destroy(&state.start_barrier);
-    group_scheduler_destroy(state.parent, state.gs);
+    portable_barrier_destroy(&state.start_barrier);
+    test_destroy_group_scheduler(state.parent, state.gs);
     hwfq_destroy(state.parent);
     TEST_PASS();
 }
@@ -488,7 +417,7 @@ static void *stress_thread_func(void *arg) {
     int thread_id = targ->thread_id;
     int ops = targ->ops;
 
-    barrier_wait(&state->start_barrier);
+    portable_barrier_wait(&state->start_barrier);
 
     for (int i = 0; i < ops; i++) {
         int op = (thread_id + i) % 5;
@@ -496,29 +425,26 @@ static void *stress_thread_func(void *arg) {
         switch (op) {
         case 0:
         case 1: {
-            // Enqueue (40% of ops)
-            group_entry_id_t entry_id = (group_entry_id_t)(i % NUM_ENTRIES);
+            group_entry_id_t entry_id = g_entry_ids[i % NUM_ENTRIES];
             session_state_t *session;
             if (group_scheduler_enqueue(state->gs, entry_id, 1024,
-                                        (void *)(uintptr_t)i, &session) == HWFQ_SUCCESS) {
+                                        (void *)(uintptr_t)i, NULL, &session) == HWFQ_SUCCESS) {
                 atomic_fetch_add(&state->enqueue_count, 1);
             }
             break;
         }
         case 2:
         case 3: {
-            // Dequeue (40% of ops)
             session_state_t *session = group_scheduler_dequeue(state->gs);
             if (session != NULL) {
                 atomic_fetch_add(&state->dequeue_count, 1);
-                free(session);
+                hwfq_free(state->parent, session);
             }
             break;
         }
         case 4: {
-            // Configure entry (20% of ops)
             group_entry_config_t cfg = {
-                .entry_id = (group_entry_id_t)(i % NUM_ENTRIES),
+                .entry_id = g_entry_ids[i % NUM_ENTRIES],
                 .allocation = {
                     .allocation_type = HWFQ_ALLOCATION_WEIGHT,
                     .weight = (uint32_t)(50 + (i % 100))
@@ -531,7 +457,6 @@ static void *stress_thread_func(void *arg) {
         }
         }
 
-        // Also exercise virtual time and getters
         if (i % 100 == 0) {
             group_scheduler_update_virtual_time(state->gs, 1000);
             (void)group_scheduler_get_virtual_time(state->gs);
@@ -550,19 +475,12 @@ void test_gs_stress_all_operations(void) {
     state.parent = create_test_parent();
     TEST_ASSERT(state.parent != NULL, "Failed to create parent scheduler");
 
-    state.gs = group_scheduler_init(state.parent, 16, 2048, 1000000000ULL, 1000);
+    state.gs = test_create_group_scheduler(state.parent, 16, 2048, 1000000000ULL, 1000);
     TEST_ASSERT(state.gs != NULL, "Failed to create group scheduler");
 
-    // Initial configuration
-    for (int i = 0; i < NUM_ENTRIES; i++) {
-        group_entry_config_t cfg = {
-            .entry_id = (group_entry_id_t)i,
-            .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
-        };
-        group_scheduler_configure_entry(state.gs, &cfg);
-    }
+    configure_test_entries(state.gs);
 
-    barrier_init(&state.start_barrier, NUM_THREADS);
+    portable_barrier_init(&state.start_barrier, NUM_THREADS);
     atomic_store(&state.enqueue_count, 0);
     atomic_store(&state.dequeue_count, 0);
     atomic_store(&state.configure_count, 0);
@@ -589,12 +507,11 @@ void test_gs_stress_all_operations(void) {
     uint64_t dequeued = atomic_load(&state.dequeue_count);
     uint64_t configured = atomic_load(&state.configure_count);
 
-    // Drain remaining
     uint64_t remaining = 0;
     session_state_t *s;
     while ((s = group_scheduler_dequeue(state.gs)) != NULL) {
         remaining++;
-        free(s);
+        hwfq_free(state.parent, s);
     }
 
     uint64_t total_ops = enqueued + dequeued + configured;
@@ -607,8 +524,8 @@ void test_gs_stress_all_operations(void) {
 
     TEST_ASSERT(enqueued == dequeued + remaining, "Accounting mismatch");
 
-    barrier_destroy(&state.start_barrier);
-    group_scheduler_destroy(state.parent, state.gs);
+    portable_barrier_destroy(&state.start_barrier);
+    test_destroy_group_scheduler(state.parent, state.gs);
     hwfq_destroy(state.parent);
     TEST_PASS();
 }

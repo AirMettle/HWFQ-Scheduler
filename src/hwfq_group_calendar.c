@@ -118,17 +118,14 @@ static void bin_list_insert(group_scheduler_t *gs, uint32_t bin_index, session_s
 {
     session_state_t **head = &gs->bin_heads[bin_index];
 
-    // Initialize session's list pointers
     session->bin_next = NULL;
     session->bin_prev = NULL;
 
-    // Empty list case
     if (*head == NULL) {
         *head = session;
         return;
     }
 
-    // Find insertion point (maintain sorted order)
     session_state_t *current = *head;
     session_state_t *prev = NULL;
 
@@ -137,13 +134,11 @@ static void bin_list_insert(group_scheduler_t *gs, uint32_t bin_index, session_s
         current = current->bin_next;
     }
 
-    // Insert at head
     if (prev == NULL) {
         session->bin_next = *head;
         (*head)->bin_prev = session;
         *head = session;
     }
-    // Insert in middle or at end
     else {
         session->bin_prev = prev;
         session->bin_next = current;
@@ -159,20 +154,16 @@ static void bin_list_remove(group_scheduler_t *gs, uint32_t bin_index, session_s
 {
     session_state_t **head = &gs->bin_heads[bin_index];
 
-    // Update previous node or head
     if (session->bin_prev != NULL) {
         session->bin_prev->bin_next = session->bin_next;
     } else {
-        // Session was head
         *head = session->bin_next;
     }
 
-    // Update next node
     if (session->bin_next != NULL) {
         session->bin_next->bin_prev = session->bin_prev;
     }
 
-    // Clear session's pointers
     session->bin_next = NULL;
     session->bin_prev = NULL;
 }
@@ -190,7 +181,7 @@ static inline session_state_t *bin_list_peek(group_scheduler_t *gs, uint32_t bin
 }
 
 // ============================================================================
-// DTS-Calendar Queue Operations (Discrete Time Scheduler)
+// DTS-Calendar Queue Operations (Dual-Time Scheduler)
 // ============================================================================
 
 int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
@@ -212,13 +203,8 @@ int calendar_insert_session(group_scheduler_t *gs, session_state_t *session)
 
     session->bin_index = bin_index;
 
-    // Insert into bin's sorted linked list
     bin_list_insert(gs, bin_index, session);
-
-    // Update bitfields
     set_bin_bit(gs->bin_bitfield, bin_index);
-
-    // Update group bitfield (groups of 32 bins)
     uint32_t group_bitfield_index = bin_index / 32;
     uint32_t group_word = group_bitfield_index / 32;
     uint32_t group_bit = group_bitfield_index % 32;
@@ -347,10 +333,7 @@ int calendar_remove_session(group_scheduler_t *gs, session_state_t *session)
         return HWFQ_ERR_INTERNAL;
     }
 
-    // Remove from bin's sorted linked list - O(1)
     bin_list_remove(gs, bin_index, session);
-
-    // Update bitfields if bin is now empty
     if (bin_list_is_empty(gs, bin_index)) {
         clear_bin_bit(gs->bin_bitfield, bin_index);
 

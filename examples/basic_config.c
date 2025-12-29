@@ -106,27 +106,29 @@ int main(void)
     // Step 4: Configure flows within tenants
     printf("4. Configuring flows within tenants...\n");
 
-    // Configure flow 100 for tenant 1 with weight 80
+    // Add flow for tenant 1 with weight 80
     hwfq_allocation_t flow_alloc_1 = {.allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 80};
+    hwfq_flow_id_t flow_id_1;
 
-    ret = hwfq_configure_flow(scheduler, standard_id, 100, &flow_alloc_1);
+    ret = hwfq_add_flow(scheduler, standard_id, &flow_alloc_1, &flow_id_1);
     if (ret != HWFQ_SUCCESS) {
-        fprintf(stderr, "Failed to configure flow: %d\n", ret);
+        fprintf(stderr, "Failed to add flow: %d\n", ret);
         hwfq_destroy(scheduler);
         return 1;
     }
-    printf("   Tenant %u, Flow 100: Weight 80\n", standard_id);
+    printf("   Tenant %u, Flow %u: Weight 80\n", standard_id, flow_id_1);
 
-    // Configure flow 200 for standard tenant with weight 20
+    // Add another flow for standard tenant with weight 20
     hwfq_allocation_t flow_alloc_2 = {.allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 20};
+    hwfq_flow_id_t flow_id_2;
 
-    ret = hwfq_configure_flow(scheduler, standard_id, 200, &flow_alloc_2);
+    ret = hwfq_add_flow(scheduler, standard_id, &flow_alloc_2, &flow_id_2);
     if (ret != HWFQ_SUCCESS) {
-        fprintf(stderr, "Failed to configure flow: %d\n", ret);
+        fprintf(stderr, "Failed to add flow: %d\n", ret);
         hwfq_destroy(scheduler);
         return 1;
     }
-    printf("   Tenant %u, Flow 200: Weight 20\n\n", standard_id);
+    printf("   Tenant %u, Flow %u: Weight 20\n\n", standard_id, flow_id_2);
 
     // Step 5: Demonstrate overbooking prevention
     printf("5. Testing overbooking prevention...\n");

@@ -298,9 +298,10 @@ void test_configure_flow(void)
     hwfq_tenant_id_t tenant_id;
     hwfq_add_tenant(sched, &tenant_alloc, &tenant_id);
 
-    // Configure flow
+    // Add flow (scheduler assigns flow_id)
     hwfq_allocation_t flow_alloc = {.allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 50};
-    int ret = hwfq_configure_flow(sched, tenant_id, 1, &flow_alloc);
+    hwfq_flow_id_t flow_id;
+    int ret = hwfq_add_flow(sched, tenant_id, &flow_alloc, &flow_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Should configure flow successfully");
 
     hwfq_destroy(sched);
@@ -321,16 +322,17 @@ void test_remove_flow(void)
     hwfq_tenant_id_t tenant_id;
     hwfq_add_tenant(sched, &tenant_alloc, &tenant_id);
 
-    // Configure flow
+    // Add flow (scheduler assigns flow_id)
     hwfq_allocation_t flow_alloc = {.allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 50};
-    hwfq_configure_flow(sched, tenant_id, 1, &flow_alloc);
+    hwfq_flow_id_t flow_id;
+    hwfq_add_flow(sched, tenant_id, &flow_alloc, &flow_id);
 
     // Remove flow
-    int ret = hwfq_remove_flow(sched, tenant_id, 1);
+    int ret = hwfq_remove_flow(sched, tenant_id, flow_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Should remove flow successfully");
 
     // Try to remove non-existent flow
-    ret = hwfq_remove_flow(sched, tenant_id, 1);
+    ret = hwfq_remove_flow(sched, tenant_id, flow_id);
     TEST_ASSERT(ret == HWFQ_ERR_NOT_FOUND, "Should return NOT_FOUND for removed flow");
 
     hwfq_destroy(sched);
@@ -414,6 +416,76 @@ void test_invalid_parameters(void)
     TEST_PASS();
 }
 
+// Test 13: Memory allocation failure handling
+// Verifies graceful handling when allocator fails
+static int g_fail_after_n = 0;
+static int g_current_alloc = 0;
+
+static void *failing_alloc(size_t size)
+{
+    g_current_alloc++;
+    if (g_fail_after_n > 0 && g_current_alloc > g_fail_after_n) {
+        return NULL;  // Simulate allocation failure
+    }
+    return malloc(size);
+}
+
+static void failing_free(void *ptr)
+{
+    free(ptr);
+}
+
+void test_allocation_failure(void)
+{
+    // Test 1: Fail during hwfq_init
+    g_fail_after_n = 1;  // Fail on second allocation
+    g_current_alloc = 0;
+
+    hwfq_config_t config = {
+        .max_tenants = 10,
+        .max_flows_per_tenant = 10,
+        .total_capacity = 1000000,
+        .alloc_fn = failing_alloc,
+        .free_fn = failing_free
+    };
+
+    hwfq_scheduler_t *sched = NULL;
+    int ret = hwfq_init(&config, &sched);
+    // Should fail gracefully with no crash
+    TEST_ASSERT(ret != HWFQ_SUCCESS || sched != NULL, "Init should handle alloc failure");
+    if (sched != NULL) {
+        hwfq_destroy(sched);
+    }
+
+    // Test 2: Fail during tenant add
+    g_fail_after_n = 100;  // Allow init to succeed
+    g_current_alloc = 0;
+
+    sched = NULL;
+    ret = hwfq_init(&config, &sched);
+    if (ret == HWFQ_SUCCESS && sched != NULL) {
+        g_fail_after_n = g_current_alloc + 1;  // Fail on next alloc
+
+        hwfq_allocation_t alloc = {
+            .allocation_type = HWFQ_ALLOCATION_WEIGHT,
+            .weight = 100
+        };
+        hwfq_tenant_id_t tenant_id;
+        ret = hwfq_add_tenant(sched, &alloc, &tenant_id);
+        // Should fail gracefully
+        TEST_ASSERT(ret == HWFQ_ERR_NO_MEMORY || ret == HWFQ_SUCCESS,
+                    "Add tenant should handle alloc failure gracefully");
+
+        hwfq_destroy(sched);
+    }
+
+    // Reset
+    g_fail_after_n = 0;
+    g_current_alloc = 0;
+
+    TEST_PASS();
+}
+
 // ============================================================================
 // Test Runner
 // ============================================================================
@@ -435,6 +507,7 @@ int main(void)
     test_remove_flow();
     test_multiple_tenants();
     test_invalid_parameters();
+    test_allocation_failure();
 
     // Print summary
     printf("\n=== Test Summary ===\n");

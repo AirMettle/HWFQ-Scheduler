@@ -2,7 +2,6 @@
 // Extended Fairness Tests for H-WFQ Scheduler
 // ============================================================================
 //
-// Story 5: Comprehensive Test Suite - Advanced Fairness Testing
 // - Long-running fairness validation (100k cycles)
 // - Extreme weight ratios (1000:1)
 // - Near-zero weights
@@ -49,8 +48,8 @@ static hwfq_scheduler_t *create_fairness_scheduler(void) {
     return scheduler;
 }
 
-static group_scheduler_t *create_test_group_scheduler(hwfq_scheduler_t *parent) {
-    return group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
+static group_scheduler_t *create_extended_group_scheduler(hwfq_scheduler_t *parent) {
+    return test_create_group_scheduler(parent, 16, 2048, 1000000000ULL, 1000);
 }
 
 static bool is_within_tolerance(double actual, double expected, double tolerance_percent) {
@@ -65,18 +64,28 @@ static bool is_within_tolerance(double actual, double expected, double tolerance
 // Test: Long Running Fairness (100k cycles)
 // ============================================================================
 
+// Helper to map entry_id back to index
+static int find_entry_index(uint32_t *entry_ids, int count, uint32_t entry_id) {
+    for (int i = 0; i < count; i++) {
+        if (entry_ids[i] == entry_id) return i;
+    }
+    return -1;
+}
+
 void test_long_running_fairness(void) {
     hwfq_scheduler_t *scheduler = create_fairness_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_extended_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
-    // Configure 5 entries with geometric weights
+    // Allocate and configure 5 entries with geometric weights
     uint32_t weights[] = {160, 80, 40, 20, 10};  // Total = 310
+    uint32_t entry_ids[5];
     for (int i = 0; i < 5; i++) {
+        test_alloc_entry(gs->entries, &entry_ids[i]);
         group_entry_config_t config = {
-            .entry_id = (uint32_t)i,
+            .entry_id = entry_ids[i],
             .allocation = {
                 .allocation_type = HWFQ_ALLOCATION_WEIGHT,
                 .weight = weights[i]
@@ -93,13 +102,14 @@ void test_long_running_fairness(void) {
     for (int cycle = 0; cycle < LONG_RUN_CYCLES; cycle++) {
         // Enqueue for all entries
         for (int i = 0; i < 5; i++) {
-            group_scheduler_enqueue(gs, i, 1024, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[i], 1024, NULL, NULL, NULL);
         }
 
         // Dequeue one
         session_state_t *session = group_scheduler_dequeue(gs);
         if (session) {
-            counts[session->entry_id]++;
+            int idx = find_entry_index(entry_ids, 5, session->entry_id);
+            if (idx >= 0) counts[idx]++;
             group_scheduler_update_virtual_time(gs, session->work_size);
             free(session);
         }
@@ -135,7 +145,7 @@ void test_long_running_fairness(void) {
 
     TEST_ASSERT(all_fair, "Long-running fairness exceeded tolerance");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -148,16 +158,21 @@ void test_extreme_weight_ratios(void) {
     hwfq_scheduler_t *scheduler = create_fairness_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_extended_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate entries
+    uint32_t entry_ids[2];
+    test_alloc_entry(gs->entries, &entry_ids[0]);
+    test_alloc_entry(gs->entries, &entry_ids[1]);
 
     // Entry 0: weight 100, Entry 1: weight 1 (100:1 ratio, more reasonable for testing)
     group_entry_config_t config0 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
     };
     group_entry_config_t config1 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 1 }
     };
     group_scheduler_configure_entry(gs, &config0);
@@ -169,16 +184,16 @@ void test_extreme_weight_ratios(void) {
     // Enqueue in proper ratio to avoid excessive buildup
     for (int cycle = 0; cycle < EXTREME_CYCLES; cycle++) {
         // Always enqueue for entry 0
-        group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
+        group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
 
         // Enqueue for entry 1 less frequently (every 100 cycles) to match weight ratio
         if (cycle % 100 == 0) {
-            group_scheduler_enqueue(gs, 1, 1024, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[1], 1024, NULL, NULL, NULL);
         }
 
         session_state_t *session = group_scheduler_dequeue(gs);
         if (session) {
-            if (session->entry_id == 0) count0++;
+            if (session->entry_id == entry_ids[0]) count0++;
             else count1++;
             group_scheduler_update_virtual_time(gs, session->work_size);
             free(session);
@@ -188,7 +203,7 @@ void test_extreme_weight_ratios(void) {
     // Drain
     session_state_t *session;
     while ((session = group_scheduler_dequeue(gs)) != NULL) {
-        if (session->entry_id == 0) count0++;
+        if (session->entry_id == entry_ids[0]) count0++;
         else count1++;
         group_scheduler_update_virtual_time(gs, session->work_size);
         free(session);
@@ -204,7 +219,7 @@ void test_extreme_weight_ratios(void) {
     // Ratio should be in reasonable range (50-200:1)
     TEST_ASSERT(ratio > 50 && ratio < 200, "Extreme ratio outside expected bounds");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -217,16 +232,21 @@ void test_near_zero_weights(void) {
     hwfq_scheduler_t *scheduler = create_fairness_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_extended_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate entries
+    uint32_t entry_ids[2];
+    test_alloc_entry(gs->entries, &entry_ids[0]);
+    test_alloc_entry(gs->entries, &entry_ids[1]);
 
     // Very small weights
     group_entry_config_t config0 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 2 }
     };
     group_entry_config_t config1 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 1 }
     };
     group_scheduler_configure_entry(gs, &config0);
@@ -238,15 +258,15 @@ void test_near_zero_weights(void) {
     // Enqueue proportionally to weights for proper fairness testing
     for (int cycle = 0; cycle < SMALL_WEIGHT_CYCLES; cycle++) {
         // Enqueue 2 for entry 0 for every 1 for entry 1 (matching weight ratio)
-        group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
-        group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
-        group_scheduler_enqueue(gs, 1, 1024, NULL, NULL);
+        group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
+        group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
+        group_scheduler_enqueue(gs, entry_ids[1], 1024, NULL, NULL, NULL);
 
         // Dequeue 3 times to drain what we just enqueued
         for (int d = 0; d < 3; d++) {
             session_state_t *session = group_scheduler_dequeue(gs);
             if (session) {
-                if (session->entry_id == 0) count0++;
+                if (session->entry_id == entry_ids[0]) count0++;
                 else count1++;
                 group_scheduler_update_virtual_time(gs, session->work_size);
                 free(session);
@@ -257,7 +277,7 @@ void test_near_zero_weights(void) {
     // Drain remaining
     session_state_t *session;
     while ((session = group_scheduler_dequeue(gs)) != NULL) {
-        if (session->entry_id == 0) count0++;
+        if (session->entry_id == entry_ids[0]) count0++;
         else count1++;
         free(session);
     }
@@ -273,7 +293,7 @@ void test_near_zero_weights(void) {
     // Ratio should be approximately 2:1 (1.5-2.5 acceptable)
     TEST_ASSERT(ratio > 1.5 && ratio < 2.5, "Near-zero weight ratio incorrect");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -286,16 +306,22 @@ void test_fairness_during_churn(void) {
     hwfq_scheduler_t *scheduler = create_fairness_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_extended_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate 3 entries upfront
+    uint32_t entry_ids[3];
+    test_alloc_entry(gs->entries, &entry_ids[0]);
+    test_alloc_entry(gs->entries, &entry_ids[1]);
+    test_alloc_entry(gs->entries, &entry_ids[2]);
 
     // Start with 2 entries of equal weight
     group_entry_config_t config0 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
     };
     group_entry_config_t config1 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
     };
     group_scheduler_configure_entry(gs, &config0);
@@ -306,13 +332,13 @@ void test_fairness_during_churn(void) {
 
     for (int cycle = 0; cycle < CHURN_FAIRNESS_CYCLES; cycle++) {
         // Enqueue for active entries
-        group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
-        group_scheduler_enqueue(gs, 1, 1024, NULL, NULL);
+        group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
+        group_scheduler_enqueue(gs, entry_ids[1], 1024, NULL, NULL, NULL);
 
         // At cycle 1000, add entry 2
         if (cycle == 1000) {
             group_entry_config_t config2 = {
-                .entry_id = 2,
+                .entry_id = entry_ids[2],
                 .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
             };
             group_scheduler_configure_entry(gs, &config2);
@@ -320,20 +346,20 @@ void test_fairness_during_churn(void) {
 
         // After adding entry 2, enqueue for it too
         if (cycle >= 1000) {
-            group_scheduler_enqueue(gs, 2, 1024, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[2], 1024, NULL, NULL, NULL);
         }
 
         // At cycle 2000, remove entry 1
         if (cycle == 2000) {
             // Drain entry 1's sessions first
-            group_scheduler_remove_entry(gs, 1);
+            group_scheduler_remove_entry(gs, entry_ids[1]);
         }
 
         session_state_t *session = group_scheduler_dequeue(gs);
         if (session) {
-            if (session->entry_id == 0) count0++;
-            else if (session->entry_id == 1) count1++;
-            else if (session->entry_id == 2) count2++;
+            if (session->entry_id == entry_ids[0]) count0++;
+            else if (session->entry_id == entry_ids[1]) count1++;
+            else if (session->entry_id == entry_ids[2]) count2++;
             group_scheduler_update_virtual_time(gs, session->work_size);
             free(session);
         }
@@ -342,9 +368,9 @@ void test_fairness_during_churn(void) {
     // Drain
     session_state_t *session;
     while ((session = group_scheduler_dequeue(gs)) != NULL) {
-        if (session->entry_id == 0) count0++;
-        else if (session->entry_id == 1) count1++;
-        else if (session->entry_id == 2) count2++;
+        if (session->entry_id == entry_ids[0]) count0++;
+        else if (session->entry_id == entry_ids[1]) count1++;
+        else if (session->entry_id == entry_ids[2]) count2++;
         free(session);
     }
 
@@ -361,7 +387,7 @@ void test_fairness_during_churn(void) {
     TEST_ASSERT(count0 > count1, "Entry 0 should have more than entry 1");
     TEST_ASSERT(count0 > count2, "Entry 0 should have more than entry 2");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -374,16 +400,21 @@ void test_temporal_fairness(void) {
     hwfq_scheduler_t *scheduler = create_fairness_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_extended_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate entries
+    uint32_t entry_ids[2];
+    test_alloc_entry(gs->entries, &entry_ids[0]);
+    test_alloc_entry(gs->entries, &entry_ids[1]);
 
     // Two entries, 2:1 weight ratio
     group_entry_config_t config0 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 200 }
     };
     group_entry_config_t config1 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
     };
     group_scheduler_configure_entry(gs, &config0);
@@ -401,12 +432,12 @@ void test_temporal_fairness(void) {
         uint64_t window_count0 = 0, window_count1 = 0;
 
         for (int cycle = 0; cycle < WINDOW_SIZE; cycle++) {
-            group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
-            group_scheduler_enqueue(gs, 1, 1024, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[1], 1024, NULL, NULL, NULL);
 
             session_state_t *session = group_scheduler_dequeue(gs);
             if (session) {
-                if (session->entry_id == 0) window_count0++;
+                if (session->entry_id == entry_ids[0]) window_count0++;
                 else window_count1++;
                 group_scheduler_update_virtual_time(gs, session->work_size);
                 free(session);
@@ -431,7 +462,7 @@ void test_temporal_fairness(void) {
 
     TEST_ASSERT(all_windows_fair, "Temporal fairness failed in one or more windows");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -444,16 +475,21 @@ void test_burst_arrival_fairness(void) {
     hwfq_scheduler_t *scheduler = create_fairness_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_extended_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate entries
+    uint32_t entry_ids[2];
+    test_alloc_entry(gs->entries, &entry_ids[0]);
+    test_alloc_entry(gs->entries, &entry_ids[1]);
 
     // Equal weights
     group_entry_config_t config0 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
     };
     group_entry_config_t config1 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 }
     };
     group_scheduler_configure_entry(gs, &config0);
@@ -466,19 +502,19 @@ void test_burst_arrival_fairness(void) {
     for (int round = 0; round < 10; round++) {
         // Entry 0 burst of 100
         for (int i = 0; i < 100; i++) {
-            group_scheduler_enqueue(gs, 0, 1024, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[0], 1024, NULL, NULL, NULL);
         }
 
         // Entry 1 burst of 100
         for (int i = 0; i < 100; i++) {
-            group_scheduler_enqueue(gs, 1, 1024, NULL, NULL);
+            group_scheduler_enqueue(gs, entry_ids[1], 1024, NULL, NULL, NULL);
         }
 
         // Drain the burst
         for (int i = 0; i < 200; i++) {
             session_state_t *session = group_scheduler_dequeue(gs);
             if (session) {
-                if (session->entry_id == 0) count0++;
+                if (session->entry_id == entry_ids[0]) count0++;
                 else count1++;
                 group_scheduler_update_virtual_time(gs, session->work_size);
                 free(session);
@@ -495,7 +531,7 @@ void test_burst_arrival_fairness(void) {
 
     TEST_ASSERT(ratio >= 0.9 && ratio <= 1.1, "Burst fairness ratio should be ~1:1");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }

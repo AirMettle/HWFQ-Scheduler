@@ -2,7 +2,6 @@
 // Statistics API Tests for H-WFQ Scheduler
 // ============================================================================
 //
-// Tests for Story 4: Statistics Tracking
 // - Verifies counter updates during enqueue/dequeue
 // - Tests wait time tracking
 // - Tests effective rate calculation
@@ -17,17 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Global test counters
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
-
-// Portable millisecond sleep (avoids usleep which isn't in ISO C99)
-static void msleep(int ms) {
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
-}
 
 // ============================================================================
 // Helper Functions
@@ -38,7 +28,7 @@ static hwfq_scheduler_t *create_scheduler_with_stats(bool enable_stats) {
         .max_tenants = 100,
         .max_flows_per_tenant = 1000,
         .max_total_flows = 10000,
-        .total_capacity = 1000000000ULL,  // 1 GB/s
+        .total_capacity = 1000000000ULL,
         .num_groups = 16,
         .bins_per_group = 2048,
         .enable_statistics = enable_stats,
@@ -79,10 +69,12 @@ void test_stats_disabled_no_overhead(void) {
     hwfq_tenant_id_t tenant_id = add_tenant(scheduler, 100);
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
-    // Enqueue and dequeue some work
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     for (int i = 0; i < 100; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        int ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        int ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed");
     }
 
@@ -95,7 +87,6 @@ void test_stats_disabled_no_overhead(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Get stats - counters should be 0 since stats disabled
     hwfq_tenant_stats_t stats;
     int ret = hwfq_get_tenant_stats(scheduler, tenant_id, &stats);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to get tenant stats");
@@ -117,14 +108,15 @@ void test_tenant_stats_basic(void) {
     hwfq_tenant_id_t tenant_id = add_tenant(scheduler, 100);
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
-    // Enqueue 10 sessions of 1024 bytes each
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     for (int i = 0; i < 10; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        int ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        int ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed");
     }
 
-    // Dequeue all
     for (int i = 0; i < 10; i++) {
         hwfq_session_t work_out;
         hwfq_tenant_id_t tid_out;
@@ -134,7 +126,6 @@ void test_tenant_stats_basic(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Get stats
     hwfq_tenant_stats_t stats;
     int ret = hwfq_get_tenant_stats(scheduler, tenant_id, &stats);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to get tenant stats");
@@ -157,19 +148,17 @@ void test_flow_stats_basic(void) {
     hwfq_tenant_id_t tenant_id = add_tenant(scheduler, 100);
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
-    // Configure flow 1
     hwfq_allocation_t flow_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
-    int ret = hwfq_configure_flow(scheduler, tenant_id, 1, &flow_alloc);
-    TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to configure flow");
+    hwfq_flow_id_t flow_id;
+    int ret = hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow_id);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add flow");
 
-    // Enqueue 5 sessions to flow 1
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 2048, .timestamp = 0 };
-        ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed");
     }
 
-    // Dequeue all
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work_out;
         hwfq_tenant_id_t tid_out;
@@ -179,9 +168,8 @@ void test_flow_stats_basic(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Get flow stats
     hwfq_flow_stats_t flow_stats;
-    ret = hwfq_get_flow_stats(scheduler, tenant_id, 1, &flow_stats);
+    ret = hwfq_get_flow_stats(scheduler, tenant_id, flow_id, &flow_stats);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to get flow stats");
     TEST_ASSERT(flow_stats.work_units_processed == 5 * 2048, "flow work_units mismatch");
     TEST_ASSERT(flow_stats.operations_completed == 5, "flow ops mismatch");
@@ -201,15 +189,15 @@ void test_wait_time_tracking(void) {
     hwfq_tenant_id_t tenant_id = add_tenant(scheduler, 100);
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
-    // Enqueue a session
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-    int ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+    int ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed");
 
-    // Wait a bit
-    msleep(10);  // 10ms
+    msleep(10);
 
-    // Dequeue
     hwfq_session_t work_out;
     hwfq_tenant_id_t tid_out;
     hwfq_flow_id_t fid_out;
@@ -217,7 +205,6 @@ void test_wait_time_tracking(void) {
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Dequeue failed");
     hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
 
-    // Get stats - wait time should be > 0
     hwfq_tenant_stats_t stats;
     ret = hwfq_get_tenant_stats(scheduler, tenant_id, &stats);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to get tenant stats");
@@ -239,10 +226,12 @@ void test_effective_rate_calculation(void) {
     hwfq_tenant_id_t tenant_id = add_tenant(scheduler, 100);
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
-    // Enqueue and dequeue rapidly to build up a rate
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     for (int i = 0; i < 100; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1000, .timestamp = 0 };
-        int ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        int ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed");
 
         hwfq_session_t work_out;
@@ -253,11 +242,9 @@ void test_effective_rate_calculation(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Get stats - effective rate should be > 0
     hwfq_tenant_stats_t stats;
     int ret = hwfq_get_tenant_stats(scheduler, tenant_id, &stats);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to get tenant stats");
-    // Rate should be calculated (may be very high since we're running fast)
     TEST_ASSERT(stats.effective_rate >= 0.0, "Effective rate should be >= 0");
 
     hwfq_destroy(scheduler);
@@ -276,17 +263,16 @@ void test_reset_specific_flow(void) {
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
     hwfq_allocation_t flow_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
-    hwfq_configure_flow(scheduler, tenant_id, 1, &flow_alloc);
-    hwfq_configure_flow(scheduler, tenant_id, 2, &flow_alloc);
+    hwfq_flow_id_t flow1_id, flow2_id;
+    hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow1_id);
+    hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow2_id);
 
-    // Enqueue to both flows
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant_id, 1, &work);
-        hwfq_enqueue(scheduler, tenant_id, 2, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow1_id, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow2_id, &work);
     }
 
-    // Dequeue all
     for (int i = 0; i < 10; i++) {
         hwfq_session_t work_out;
         hwfq_tenant_id_t tid_out;
@@ -295,13 +281,11 @@ void test_reset_specific_flow(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Reset only flow 1
-    hwfq_reset_stats(scheduler, tenant_id, 1);
+    hwfq_reset_stats(scheduler, tenant_id, flow1_id);
 
-    // Flow 1 should be reset, flow 2 should retain stats
     hwfq_flow_stats_t flow1_stats, flow2_stats;
-    hwfq_get_flow_stats(scheduler, tenant_id, 1, &flow1_stats);
-    hwfq_get_flow_stats(scheduler, tenant_id, 2, &flow2_stats);
+    hwfq_get_flow_stats(scheduler, tenant_id, flow1_id, &flow1_stats);
+    hwfq_get_flow_stats(scheduler, tenant_id, flow2_id, &flow2_stats);
 
     TEST_ASSERT(flow1_stats.work_units_processed == 0, "Flow 1 should be reset");
     TEST_ASSERT(flow2_stats.work_units_processed > 0, "Flow 2 should retain stats");
@@ -322,14 +306,14 @@ void test_reset_all_flows(void) {
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
     hwfq_allocation_t flow_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
-    hwfq_configure_flow(scheduler, tenant_id, 1, &flow_alloc);
-    hwfq_configure_flow(scheduler, tenant_id, 2, &flow_alloc);
+    hwfq_flow_id_t flow1_id, flow2_id;
+    hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow1_id);
+    hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow2_id);
 
-    // Enqueue and dequeue
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant_id, 1, &work);
-        hwfq_enqueue(scheduler, tenant_id, 2, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow1_id, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow2_id, &work);
     }
     for (int i = 0; i < 10; i++) {
         hwfq_session_t work_out;
@@ -339,18 +323,15 @@ void test_reset_all_flows(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Reset all flows for tenant
     hwfq_reset_stats(scheduler, tenant_id, HWFQ_ALL_FLOWS);
 
-    // Both flows should be reset
     hwfq_flow_stats_t flow1_stats, flow2_stats;
-    hwfq_get_flow_stats(scheduler, tenant_id, 1, &flow1_stats);
-    hwfq_get_flow_stats(scheduler, tenant_id, 2, &flow2_stats);
+    hwfq_get_flow_stats(scheduler, tenant_id, flow1_id, &flow1_stats);
+    hwfq_get_flow_stats(scheduler, tenant_id, flow2_id, &flow2_stats);
 
     TEST_ASSERT(flow1_stats.work_units_processed == 0, "Flow 1 should be reset");
     TEST_ASSERT(flow2_stats.work_units_processed == 0, "Flow 2 should be reset");
 
-    // Tenant stats should also be reset
     hwfq_tenant_stats_t tenant_stats;
     hwfq_get_tenant_stats(scheduler, tenant_id, &tenant_stats);
     TEST_ASSERT(tenant_stats.work_units_processed == 0, "Tenant should be reset");
@@ -372,11 +353,15 @@ void test_reset_all_tenants(void) {
     TEST_ASSERT(tenant1 != (hwfq_tenant_id_t)-1, "Failed to add tenant1");
     TEST_ASSERT(tenant2 != (hwfq_tenant_id_t)-1, "Failed to add tenant2");
 
-    // Enqueue and dequeue for both tenants
+    hwfq_flow_id_t flow1_id = test_add_flow(scheduler, tenant1);
+    hwfq_flow_id_t flow2_id = test_add_flow(scheduler, tenant2);
+    TEST_ASSERT(flow1_id != 0, "Failed to add flow1");
+    TEST_ASSERT(flow2_id != 0, "Failed to add flow2");
+
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant1, 1, &work);
-        hwfq_enqueue(scheduler, tenant2, 1, &work);
+        hwfq_enqueue(scheduler, tenant1, flow1_id, &work);
+        hwfq_enqueue(scheduler, tenant2, flow2_id, &work);
     }
     for (int i = 0; i < 10; i++) {
         hwfq_session_t work_out;
@@ -386,10 +371,8 @@ void test_reset_all_tenants(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Reset all tenants
     hwfq_reset_stats(scheduler, HWFQ_ALL_TENANTS, 0);
 
-    // Both tenants should be reset
     hwfq_tenant_stats_t stats1, stats2;
     hwfq_get_tenant_stats(scheduler, tenant1, &stats1);
     hwfq_get_tenant_stats(scheduler, tenant2, &stats2);
@@ -413,24 +396,22 @@ void test_backlog_tracking(void) {
     TEST_ASSERT(tenant_id != (hwfq_tenant_id_t)-1, "Failed to add tenant");
 
     hwfq_allocation_t flow_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
-    hwfq_configure_flow(scheduler, tenant_id, 1, &flow_alloc);
+    hwfq_flow_id_t flow_id;
+    hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow_id);
 
-    // Enqueue 5 sessions
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
     }
 
-    // Check backlog
     hwfq_tenant_stats_t stats;
     hwfq_get_tenant_stats(scheduler, tenant_id, &stats);
     TEST_ASSERT(stats.current_backlog == 5, "Backlog should be 5");
 
     hwfq_flow_stats_t flow_stats;
-    hwfq_get_flow_stats(scheduler, tenant_id, 1, &flow_stats);
+    hwfq_get_flow_stats(scheduler, tenant_id, flow_id, &flow_stats);
     TEST_ASSERT(flow_stats.current_backlog == 5, "Flow backlog should be 5");
 
-    // Dequeue 3
     for (int i = 0; i < 3; i++) {
         hwfq_session_t work_out;
         hwfq_tenant_id_t tid_out;
@@ -439,11 +420,10 @@ void test_backlog_tracking(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Check backlog again
     hwfq_get_tenant_stats(scheduler, tenant_id, &stats);
     TEST_ASSERT(stats.current_backlog == 2, "Backlog should be 2");
 
-    hwfq_get_flow_stats(scheduler, tenant_id, 1, &flow_stats);
+    hwfq_get_flow_stats(scheduler, tenant_id, flow_id, &flow_stats);
     TEST_ASSERT(flow_stats.current_backlog == 2, "Flow backlog should be 2");
 
     hwfq_destroy(scheduler);
@@ -463,17 +443,20 @@ void test_stats_with_multiple_tenants(void) {
     TEST_ASSERT(tenant1 != (hwfq_tenant_id_t)-1, "Failed to add tenant1");
     TEST_ASSERT(tenant2 != (hwfq_tenant_id_t)-1, "Failed to add tenant2");
 
-    // Enqueue different amounts
+    hwfq_flow_id_t flow1_id = test_add_flow(scheduler, tenant1);
+    hwfq_flow_id_t flow2_id = test_add_flow(scheduler, tenant2);
+    TEST_ASSERT(flow1_id != 0, "Failed to add flow1");
+    TEST_ASSERT(flow2_id != 0, "Failed to add flow2");
+
     for (int i = 0; i < 10; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1000, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant1, 1, &work);
+        hwfq_enqueue(scheduler, tenant1, flow1_id, &work);
     }
     for (int i = 0; i < 5; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 2000, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant2, 1, &work);
+        hwfq_enqueue(scheduler, tenant2, flow2_id, &work);
     }
 
-    // Dequeue all
     for (int i = 0; i < 15; i++) {
         hwfq_session_t work_out;
         hwfq_tenant_id_t tid_out;
@@ -482,7 +465,6 @@ void test_stats_with_multiple_tenants(void) {
         hwfq_complete(scheduler, &work_out, tid_out, fid_out, get_time_ns_bench());
     }
 
-    // Check stats are isolated
     hwfq_tenant_stats_t stats1, stats2;
     hwfq_get_tenant_stats(scheduler, tenant1, &stats1);
     hwfq_get_tenant_stats(scheduler, tenant2, &stats2);

@@ -2,7 +2,6 @@
 // Performance Benchmarks for H-WFQ Scheduler
 // ============================================================================
 //
-// Story 5: Comprehensive Test Suite - Performance Benchmarks
 // - Measures enqueue/dequeue throughput
 // - Measures stats overhead
 // - Measures multi-tenant throughput
@@ -197,24 +196,25 @@ void bench_multi_tenant_throughput(void) {
     #define FLOWS_PER_TENANT 10
 
     hwfq_tenant_id_t tenants[NUM_TENANTS];
+    hwfq_flow_id_t flows[NUM_TENANTS][FLOWS_PER_TENANT];
     hwfq_allocation_t alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
 
     for (int t = 0; t < NUM_TENANTS; t++) {
         int ret = hwfq_add_tenant(scheduler, &alloc, &tenants[t]);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add tenant");
 
-        // Configure flows
-        for (int f = 1; f <= FLOWS_PER_TENANT; f++) {
-            hwfq_configure_flow(scheduler, tenants[t], f, &alloc);
+        // Add flows
+        for (int f = 0; f < FLOWS_PER_TENANT; f++) {
+            hwfq_add_flow(scheduler, tenants[t], &alloc, &flows[t][f]);
         }
     }
 
     // Pre-enqueue work for each tenant/flow
     for (int t = 0; t < NUM_TENANTS; t++) {
-        for (int f = 1; f <= FLOWS_PER_TENANT; f++) {
+        for (int f = 0; f < FLOWS_PER_TENANT; f++) {
             for (int i = 0; i < 10; i++) {
                 hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-                hwfq_enqueue(scheduler, tenants[t], f, &work);
+                hwfq_enqueue(scheduler, tenants[t], flows[t][f], &work);
             }
         }
     }

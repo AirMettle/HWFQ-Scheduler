@@ -16,7 +16,6 @@
 #include "test_common.h"
 #include "../src/hwfq_group_scheduler_internal.h"
 #include "../src/hwfq_internal.h"
-#include "../src/hwfq_memory_pool.h"
 #include "../include/hwfq.h"
 #include <stdlib.h>
 #include <string.h>
@@ -66,14 +65,19 @@ static hwfq_scheduler_t *create_test_scheduler(void) {
     return scheduler;
 }
 
-static group_scheduler_t *create_test_group_scheduler(hwfq_scheduler_t *parent) {
-    return group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
+static group_scheduler_t *create_fairness_group_scheduler(hwfq_scheduler_t *parent) {
+    return test_create_group_scheduler(parent, 16, 2048, 1000000000ULL, 1000);
 }
+
+static uint32_t g_entry_ids[NUM_ENTRIES];
 
 static void configure_geometric_entries(group_scheduler_t *gs) {
     for (int i = 0; i < NUM_ENTRIES; i++) {
+        // Allocate entry first
+        test_alloc_entry(gs->entries, &g_entry_ids[i]);
+
         group_entry_config_t config = {
-            .entry_id = (uint32_t)i,
+            .entry_id = g_entry_ids[i],
             .allocation = {
                 .allocation_type = HWFQ_ALLOCATION_WEIGHT,
                 .weight = GEOMETRIC_WEIGHTS[i]
@@ -103,7 +107,7 @@ void test_geometric_weights_all_backlogged(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_fairness_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     // Configure entries with geometric weights
@@ -117,7 +121,7 @@ void test_geometric_weights_all_backlogged(void) {
         // Enqueue work for all entries (keep them backlogged)
         for (int i = 0; i < NUM_ENTRIES; i++) {
             session_state_t *session = NULL;
-            int ret = group_scheduler_enqueue(gs, (uint32_t)i, 4096, NULL, &session);
+            int ret = group_scheduler_enqueue(gs, g_entry_ids[i], 4096, NULL, NULL, &session);
             TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to enqueue session");
         }
 
@@ -125,10 +129,17 @@ void test_geometric_weights_all_backlogged(void) {
         session_state_t *session = group_scheduler_dequeue(gs);
         TEST_ASSERT(session != NULL, "Failed to dequeue session");
 
-        // Count which entry was scheduled
+        // Count which entry was scheduled - map back to index
         group_entry_id_t entry_id = session_get_entry_id(session);
-        TEST_ASSERT(entry_id < NUM_ENTRIES, "Invalid entry ID");
-        dequeue_counts[entry_id]++;
+        int entry_index = -1;
+        for (int i = 0; i < NUM_ENTRIES; i++) {
+            if (g_entry_ids[i] == entry_id) {
+                entry_index = i;
+                break;
+            }
+        }
+        TEST_ASSERT(entry_index >= 0, "Invalid entry ID");
+        dequeue_counts[entry_index]++;
 
         // Update virtual time
         group_scheduler_update_virtual_time(gs, session_get_work_size(session));
@@ -183,7 +194,7 @@ void test_geometric_weights_all_backlogged(void) {
 
     TEST_ASSERT(all_within_tolerance, "Allocation ratios exceed tolerance");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -203,12 +214,12 @@ void test_progressive_removal(void) {
     {
         hwfq_scheduler_t *scheduler = create_test_scheduler();
         TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
-        group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+        group_scheduler_t *gs = create_fairness_group_scheduler(scheduler);
         TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
         configure_geometric_entries(gs);
 
-        // Remove entry 0
-        int ret = group_scheduler_remove_entry(gs, 0);
+        // Remove entry 0 (use g_entry_ids[0])
+        int ret = group_scheduler_remove_entry(gs, g_entry_ids[0]);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to remove entry 0");
 
         // Count dequeues for remaining entries (1-9)
@@ -218,11 +229,19 @@ void test_progressive_removal(void) {
         for (int cycle = 0; cycle < cycles; cycle++) {
             for (int i = 1; i < NUM_ENTRIES; i++) {
                 session_state_t *session = NULL;
-                group_scheduler_enqueue(gs, (uint32_t)i, 4096, NULL, &session);
+                group_scheduler_enqueue(gs, g_entry_ids[i], 4096, NULL, NULL, &session);
             }
             session_state_t *session = group_scheduler_dequeue(gs);
             if (session != NULL) {
-                dequeue_counts[session->entry_id]++;
+                // Map back to index
+                int entry_index = -1;
+                for (int i = 1; i < NUM_ENTRIES; i++) {
+                    if (g_entry_ids[i] == session->entry_id) {
+                        entry_index = i;
+                        break;
+                    }
+                }
+                if (entry_index >= 0) dequeue_counts[entry_index]++;
                 group_scheduler_update_virtual_time(gs, session->work_size);
                 hwfq_free(scheduler, session);
             }
@@ -239,7 +258,7 @@ void test_progressive_removal(void) {
         TEST_ASSERT(is_within_tolerance(actual, expected, TOLERANCE_PERCENT + 5.0),
                     "Entry 1 allocation after removal exceeds tolerance");
 
-        group_scheduler_destroy(scheduler, gs);
+        test_destroy_group_scheduler(scheduler, gs);
         hwfq_destroy(scheduler);
     }
 
@@ -247,12 +266,12 @@ void test_progressive_removal(void) {
     {
         hwfq_scheduler_t *scheduler = create_test_scheduler();
         TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
-        group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+        group_scheduler_t *gs = create_fairness_group_scheduler(scheduler);
         TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
         configure_geometric_entries(gs);
 
-        group_scheduler_remove_entry(gs, 0);
-        group_scheduler_remove_entry(gs, 1);
+        group_scheduler_remove_entry(gs, g_entry_ids[0]);
+        group_scheduler_remove_entry(gs, g_entry_ids[1]);
 
         uint64_t dequeue_counts[NUM_ENTRIES] = {0};
         int cycles = SCHEDULING_CYCLES / 2;
@@ -260,11 +279,19 @@ void test_progressive_removal(void) {
         for (int cycle = 0; cycle < cycles; cycle++) {
             for (int i = 2; i < NUM_ENTRIES; i++) {
                 session_state_t *session = NULL;
-                group_scheduler_enqueue(gs, (uint32_t)i, 4096, NULL, &session);
+                group_scheduler_enqueue(gs, g_entry_ids[i], 4096, NULL, NULL, &session);
             }
             session_state_t *session = group_scheduler_dequeue(gs);
             if (session != NULL) {
-                dequeue_counts[session->entry_id]++;
+                // Map back to index
+                int entry_index = -1;
+                for (int i = 2; i < NUM_ENTRIES; i++) {
+                    if (g_entry_ids[i] == session->entry_id) {
+                        entry_index = i;
+                        break;
+                    }
+                }
+                if (entry_index >= 0) dequeue_counts[entry_index]++;
                 group_scheduler_update_virtual_time(gs, session->work_size);
                 hwfq_free(scheduler, session);
             }
@@ -281,7 +308,7 @@ void test_progressive_removal(void) {
         TEST_ASSERT(is_within_tolerance(actual, expected, TOLERANCE_PERCENT + 5.0),
                     "Entry 2 allocation after removal exceeds tolerance");
 
-        group_scheduler_destroy(scheduler, gs);
+        test_destroy_group_scheduler(scheduler, gs);
         hwfq_destroy(scheduler);
     }
 
@@ -296,34 +323,40 @@ void test_mixed_rate_and_weight(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_fairness_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate entries first
+    uint32_t entry_ids[4];
+    for (int i = 0; i < 4; i++) {
+        test_alloc_entry(gs->entries, &entry_ids[i]);
+    }
 
     // Configure 2 rate-based entries (each gets 25% of capacity)
     // and 2 weight-based entries (split remaining 50% by weights 3:1)
     group_entry_config_t rate_config1 = {
-        .entry_id = 0,
+        .entry_id = entry_ids[0],
         .allocation = {
             .allocation_type = HWFQ_ALLOCATION_RATE,
             .rate = 250000000ULL  // 250 MB/s (25%)
         }
     };
     group_entry_config_t rate_config2 = {
-        .entry_id = 1,
+        .entry_id = entry_ids[1],
         .allocation = {
             .allocation_type = HWFQ_ALLOCATION_RATE,
             .rate = 250000000ULL  // 250 MB/s (25%)
         }
     };
     group_entry_config_t weight_config1 = {
-        .entry_id = 2,
+        .entry_id = entry_ids[2],
         .allocation = {
             .allocation_type = HWFQ_ALLOCATION_WEIGHT,
             .weight = 75  // Should get 75% of remaining 50% = 37.5%
         }
     };
     group_entry_config_t weight_config2 = {
-        .entry_id = 3,
+        .entry_id = entry_ids[3],
         .allocation = {
             .allocation_type = HWFQ_ALLOCATION_WEIGHT,
             .weight = 25  // Should get 25% of remaining 50% = 12.5%
@@ -350,7 +383,7 @@ void test_mixed_rate_and_weight(void) {
         // Enqueue work for all entries
         for (int i = 0; i < 4; i++) {
             session_state_t *session = NULL;
-            ret = group_scheduler_enqueue(gs, (uint32_t)i, 4096, NULL, &session);
+            ret = group_scheduler_enqueue(gs, entry_ids[i], 4096, NULL, NULL, &session);
             TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to enqueue session");
         }
 
@@ -358,8 +391,14 @@ void test_mixed_rate_and_weight(void) {
         session_state_t *session = group_scheduler_dequeue(gs);
         TEST_ASSERT(session != NULL, "Failed to dequeue session");
 
+        // Map entry_id back to index
         group_entry_id_t entry_id = session_get_entry_id(session);
-        dequeue_counts[entry_id]++;
+        for (int i = 0; i < 4; i++) {
+            if (entry_ids[i] == entry_id) {
+                dequeue_counts[i]++;
+                break;
+            }
+        }
 
         group_scheduler_update_virtual_time(gs, session_get_work_size(session));
         hwfq_free(scheduler, session);
@@ -388,40 +427,7 @@ void test_mixed_rate_and_weight(void) {
     // Weight-based entries should split remaining 50% as 75:25 = 37.5%:12.5%
     // With rate margin (1/2), these ratios should still hold relatively
 
-    group_scheduler_destroy(scheduler, gs);
-    hwfq_destroy(scheduler);
-    TEST_PASS();
-}
-
-// ============================================================================
-// Test: Memory Pool Allocation
-// ============================================================================
-
-void test_memory_pool_basic(void) {
-    hwfq_scheduler_t *scheduler = create_test_scheduler();
-    TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
-
-    // Verify memory pool is initialized
-    TEST_ASSERT(scheduler->session_pool != NULL, "Memory pool not initialized");
-    TEST_ASSERT(hwfq_memory_pool_capacity(scheduler->session_pool) > 0,
-                "Memory pool has no capacity");
-
-    // Allocate some sessions
-    session_state_t *sessions[100];
-    for (int i = 0; i < 100; i++) {
-        sessions[i] = hwfq_memory_pool_alloc_session(scheduler->session_pool);
-        TEST_ASSERT(sessions[i] != NULL, "Failed to allocate session from pool");
-    }
-
-    // Verify allocation count
-    TEST_ASSERT(hwfq_memory_pool_allocated_count(scheduler->session_pool) >= 100,
-                "Incorrect allocation count");
-
-    // Free sessions
-    for (int i = 0; i < 100; i++) {
-        hwfq_memory_pool_free_session(scheduler->session_pool, sessions[i]);
-    }
-
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -443,13 +449,11 @@ void test_flow_id_zero_reserved(void) {
     int ret = hwfq_add_tenant(scheduler, &alloc, &tenant_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add tenant");
 
-    // Try to configure flow ID 0 (should fail)
-    ret = hwfq_configure_flow(scheduler, tenant_id, HWFQ_FLOW_ID_RESERVED, &alloc);
-    TEST_ASSERT(ret == HWFQ_ERR_INVALID_ARG, "Flow ID 0 should be rejected");
-
-    // Configure a valid flow ID (should succeed)
-    ret = hwfq_configure_flow(scheduler, tenant_id, 1, &alloc);
-    TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to configure valid flow ID");
+    // Add a valid flow (scheduler assigns flow_id)
+    hwfq_flow_id_t flow_id;
+    ret = hwfq_add_flow(scheduler, tenant_id, &alloc, &flow_id);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add valid flow");
+    TEST_ASSERT(flow_id != HWFQ_FLOW_ID_RESERVED, "Flow ID 0 should never be assigned");
 
     hwfq_destroy(scheduler);
     TEST_PASS();
@@ -472,20 +476,21 @@ void test_flow_reconfiguration(void) {
     int ret = hwfq_add_tenant(scheduler, &tenant_alloc, &tenant_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add tenant");
 
-    // Configure a flow
+    // Add a flow (scheduler assigns flow_id)
     hwfq_allocation_t flow_alloc = {
         .allocation_type = HWFQ_ALLOCATION_WEIGHT,
         .weight = 50
     };
-    ret = hwfq_configure_flow(scheduler, tenant_id, 1, &flow_alloc);
-    TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to configure flow");
+    hwfq_flow_id_t flow_id;
+    ret = hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow_id);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add flow");
 
     // Reconfigure flow (should succeed)
     hwfq_allocation_t new_alloc = {
         .allocation_type = HWFQ_ALLOCATION_WEIGHT,
         .weight = 100
     };
-    ret = hwfq_reconfigure_flow(scheduler, tenant_id, 1, &new_alloc);
+    ret = hwfq_reconfigure_flow(scheduler, tenant_id, flow_id, &new_alloc);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to reconfigure flow");
 
     // Reconfigure non-existent flow (should fail)
@@ -496,6 +501,107 @@ void test_flow_reconfiguration(void) {
     ret = hwfq_reconfigure_flow(scheduler, tenant_id, HWFQ_FLOW_ID_RESERVED, &new_alloc);
     TEST_ASSERT(ret == HWFQ_ERR_INVALID_ARG, "Reconfiguring flow ID 0 should fail");
 
+    hwfq_destroy(scheduler);
+    TEST_PASS();
+}
+
+// ============================================================================
+// Test: Pure Rate-Based Fairness
+// ============================================================================
+
+void test_rate_based_fairness(void) {
+    hwfq_scheduler_t *scheduler = create_test_scheduler();
+    TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
+
+    group_scheduler_t *gs = create_fairness_group_scheduler(scheduler);
+    TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
+
+    // Allocate 4 entries with rate-based allocation
+    // Rates: 400, 300, 200, 100 MB/s (total 1000 MB/s = 1 GB/s)
+    // Expected ratios: 40%, 30%, 20%, 10%
+    uint32_t entry_ids[4];
+    uint64_t rates[4] = {400000000ULL, 300000000ULL, 200000000ULL, 100000000ULL};
+
+    for (int i = 0; i < 4; i++) {
+        test_alloc_entry(gs->entries, &entry_ids[i]);
+
+        group_entry_config_t config = {
+            .entry_id = entry_ids[i],
+            .allocation = {
+                .allocation_type = HWFQ_ALLOCATION_RATE,
+                .rate = rates[i]
+            }
+        };
+        int ret = group_scheduler_configure_entry(gs, &config);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to configure rate entry");
+    }
+
+    // Run scheduling cycles
+    uint64_t dequeue_counts[4] = {0};
+    int cycles = SCHEDULING_CYCLES;
+
+    for (int cycle = 0; cycle < cycles; cycle++) {
+        // Enqueue work for all entries
+        for (int i = 0; i < 4; i++) {
+            session_state_t *session = NULL;
+            int ret = group_scheduler_enqueue(gs, entry_ids[i], 4096, NULL, NULL, &session);
+            TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to enqueue session");
+        }
+
+        // Dequeue one session
+        session_state_t *session = group_scheduler_dequeue(gs);
+        TEST_ASSERT(session != NULL, "Failed to dequeue session");
+
+        // Map entry_id back to index
+        group_entry_id_t entry_id = session_get_entry_id(session);
+        for (int i = 0; i < 4; i++) {
+            if (entry_ids[i] == entry_id) {
+                dequeue_counts[i]++;
+                break;
+            }
+        }
+
+        group_scheduler_update_virtual_time(gs, session_get_work_size(session));
+        hwfq_free(scheduler, session);
+    }
+
+    // Drain remaining sessions
+    while (!group_scheduler_is_empty(gs)) {
+        session_state_t *session = group_scheduler_dequeue(gs);
+        if (session != NULL) {
+            hwfq_free(scheduler, session);
+        }
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < 4; i++) {
+        total += dequeue_counts[i];
+    }
+
+    // Expected ratios based on rate (accounting for rate margin factor of 1/2)
+    // The rate margin factor divides by 2, so effective weights are:
+    // 400/2=200, 300/2=150, 200/2=100, 100/2=50 => total 500
+    // Ratios should still be 4:3:2:1 = 40%, 30%, 20%, 10%
+    double expected_ratios[4] = {0.40, 0.30, 0.20, 0.10};
+
+    printf("    Rate-Based Fairness Results:\n");
+    bool all_within_tolerance = true;
+    for (int i = 0; i < 4; i++) {
+        double actual_ratio = (double)dequeue_counts[i] / (double)total;
+        double deviation = fabs((actual_ratio - expected_ratios[i]) / expected_ratios[i]) * 100.0;
+        printf("      Entry %d (rate %llu MB/s): expected %.2f, actual %.4f (%.2f%% deviation)\n",
+               i, (unsigned long long)(rates[i] / 1000000), expected_ratios[i], actual_ratio, deviation);
+
+        // Allow higher tolerance for the lowest-rate entry
+        double adjusted_tolerance = (i == 3) ? 25.0 : TOLERANCE_PERCENT;
+        if (!is_within_tolerance(actual_ratio, expected_ratios[i], adjusted_tolerance)) {
+            all_within_tolerance = false;
+        }
+    }
+
+    TEST_ASSERT(all_within_tolerance, "Rate-based allocation ratios exceed tolerance");
+
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -516,14 +622,14 @@ int main(void) {
     printf("\nRunning test_mixed_rate_and_weight...\n");
     test_mixed_rate_and_weight();
 
-    printf("\nRunning test_memory_pool_basic...\n");
-    test_memory_pool_basic();
-
     printf("\nRunning test_flow_id_zero_reserved...\n");
     test_flow_id_zero_reserved();
 
     printf("\nRunning test_flow_reconfiguration...\n");
     test_flow_reconfiguration();
+
+    printf("\nRunning test_rate_based_fairness...\n");
+    test_rate_based_fairness();
 
     printf("\n=== Test Summary ===\n");
     printf("Passed: %d\n", g_tests_passed);

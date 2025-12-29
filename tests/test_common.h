@@ -3,8 +3,39 @@
 
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
 #include <time.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <pthread.h>
+
+#include "../include/hwfq.h"
+#include "../src/hwfq_group_scheduler.h"
+#include "../src/hwfq_chunked_entries.h"
+#include "../src/hwfq_group_scheduler_internal.h"
+
+// ============================================================================
+// Portable Barrier Implementation (for macOS compatibility)
+// ============================================================================
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int count;
+    int target;
+    int generation;
+} portable_barrier_t;
+
+int portable_barrier_init(portable_barrier_t *b, int count);
+void portable_barrier_destroy(portable_barrier_t *b);
+void portable_barrier_wait(portable_barrier_t *b);
+
+// ============================================================================
+// Sleep Helper (portable)
+// ============================================================================
+
+void msleep(int ms);
 
 // ============================================================================
 // Benchmark Timing Macros
@@ -24,7 +55,6 @@
 #define BENCH_OPS_PER_SEC(ops) \
     ((double)(ops) * 1000000000.0 / (double)BENCH_ELAPSED_NS())
 
-// Get current time in nanoseconds
 static inline uint64_t get_time_ns_bench(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -51,10 +81,28 @@ static inline uint64_t get_time_ns_bench(void) {
     } while (0)
 
 // ============================================================================
-// Global Test Counters (must be defined in each test file)
+// Test Helper Functions
 // ============================================================================
 
-// extern int g_tests_passed;
-// extern int g_tests_failed;
+group_scheduler_t *test_create_group_scheduler(
+    hwfq_scheduler_t *parent,
+    uint32_t num_groups,
+    uint32_t bins_per_group,
+    uint64_t total_capacity,
+    uint32_t max_entries);
+
+void test_destroy_group_scheduler(hwfq_scheduler_t *parent, group_scheduler_t *gs);
+
+void test_drain_all_sessions(hwfq_scheduler_t *parent, group_scheduler_t *gs);
+
+void test_hwfq_destroy(hwfq_scheduler_t *scheduler);
+
+int test_alloc_entry(hwfq_chunked_entries_t *entries, uint32_t *entry_id_out);
+
+hwfq_flow_id_t test_add_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id);
+
+hwfq_flow_id_t test_add_flow_with_weight(hwfq_scheduler_t *scheduler,
+                                          hwfq_tenant_id_t tenant_id,
+                                          uint32_t weight);
 
 #endif // TEST_COMMON_H

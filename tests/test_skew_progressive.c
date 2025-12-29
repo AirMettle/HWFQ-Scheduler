@@ -20,7 +20,6 @@
 #include "test_common.h"
 #include "../src/hwfq_group_scheduler_internal.h"
 #include "../src/hwfq_internal.h"
-#include "../src/hwfq_memory_pool.h"
 #include "../include/hwfq.h"
 #include <stdlib.h>
 #include <string.h>
@@ -71,14 +70,20 @@ static hwfq_scheduler_t *create_test_scheduler(void) {
     return scheduler;
 }
 
-static group_scheduler_t *create_test_group_scheduler(hwfq_scheduler_t *parent) {
-    return group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
+static group_scheduler_t *create_skew_group_scheduler(hwfq_scheduler_t *parent) {
+    return test_create_group_scheduler(parent, 16, 2048, 1000000000ULL, 1000);
 }
+
+// Store allocated entry IDs for use across phases
+static uint32_t g_entry_ids[NUM_ENTRIES];
 
 static void configure_geometric_entries(group_scheduler_t *gs) {
     for (int i = 0; i < NUM_ENTRIES; i++) {
+        // Allocate entry from chunked storage
+        test_alloc_entry(gs->entries, &g_entry_ids[i]);
+
         group_entry_config_t config = {
-            .entry_id = (uint32_t)i,
+            .entry_id = g_entry_ids[i],
             .allocation = {
                 .allocation_type = HWFQ_ALLOCATION_WEIGHT,
                 .weight = SKEW_WEIGHTS[i]
@@ -136,6 +141,14 @@ typedef struct {
 // Run a single phase: enqueue/dequeue cycles for active entries
 // ============================================================================
 
+// Helper to find index from entry_id
+static int find_entry_index(uint32_t entry_id) {
+    for (int i = 0; i < NUM_ENTRIES; i++) {
+        if (g_entry_ids[i] == entry_id) return i;
+    }
+    return -1;
+}
+
 static phase_result_t run_phase(hwfq_scheduler_t *scheduler,
                                  group_scheduler_t *gs,
                                  int first_active,
@@ -154,9 +167,9 @@ static phase_result_t run_phase(hwfq_scheduler_t *scheduler,
         // Enqueue work for all ACTIVE entries (keep them backlogged)
         for (int i = first_active; i < NUM_ENTRIES; i++) {
             session_state_t *session = NULL;
-            int ret = group_scheduler_enqueue(gs, (uint32_t)i, 4096, NULL, &session);
+            int ret = group_scheduler_enqueue(gs, g_entry_ids[i], 4096, NULL, NULL, &session);
             if (ret != HWFQ_SUCCESS) {
-                printf("      ERROR: Failed to enqueue for entry %d\n", i);
+                printf("      ERROR: Failed to enqueue for entry %d (id=%u)\n", i, g_entry_ids[i]);
                 return result;
             }
         }
@@ -170,8 +183,9 @@ static phase_result_t run_phase(hwfq_scheduler_t *scheduler,
 
         // Count which entry was scheduled
         group_entry_id_t entry_id = session_get_entry_id(session);
-        if (entry_id < NUM_ENTRIES) {
-            result.dequeue_counts[entry_id]++;
+        int idx = find_entry_index(entry_id);
+        if (idx >= 0 && idx < NUM_ENTRIES) {
+            result.dequeue_counts[idx]++;
             result.total_dequeues++;
         }
 
@@ -243,7 +257,7 @@ void test_all_backlogged(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_skew_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     // Configure entries with geometric weights
@@ -257,7 +271,7 @@ void test_all_backlogged(void) {
     bool ok = validate_phase(&result, 1, true);
     TEST_ASSERT(ok, "Phase 1 allocation ratios exceed tolerance");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -272,7 +286,7 @@ void test_progressive_removal_live(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_skew_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     // Configure entries with geometric weights
@@ -291,10 +305,10 @@ void test_progressive_removal_live(void) {
         // (except for phase 1 where all entries are active)
         if (phase > 1) {
             int entry_to_remove = phase - 2;
-            int ret = group_scheduler_remove_entry(gs, (uint32_t)entry_to_remove);
+            int ret = group_scheduler_remove_entry(gs, g_entry_ids[entry_to_remove]);
             if (ret != HWFQ_SUCCESS) {
-                printf("      WARNING: Failed to remove entry %d (may already be removed)\n",
-                       entry_to_remove);
+                printf("      WARNING: Failed to remove entry %d (id=%u, may already be removed)\n",
+                       entry_to_remove, g_entry_ids[entry_to_remove]);
             }
         }
 
@@ -318,7 +332,7 @@ void test_progressive_removal_live(void) {
 
     TEST_ASSERT(all_phases_ok, "One or more phases failed tolerance check");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -333,7 +347,7 @@ void test_highest_gets_half(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_skew_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     configure_geometric_entries(gs);
@@ -347,7 +361,7 @@ void test_highest_gets_half(void) {
 
         // Remove previous highest
         if (phase > 1) {
-            group_scheduler_remove_entry(gs, (uint32_t)(phase - 2));
+            group_scheduler_remove_entry(gs, g_entry_ids[phase - 2]);
         }
 
         phase_result_t result = run_phase(scheduler, gs, first_active, CYCLES_PER_PHASE);
@@ -373,7 +387,7 @@ void test_highest_gets_half(void) {
 
     TEST_ASSERT(all_ok, "Highest entry did not get expected ~50% in one or more phases");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }

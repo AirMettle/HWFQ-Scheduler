@@ -110,6 +110,13 @@ void test_4000_tenants(void) {
     TEST_ASSERT(capacity.num_configured_tenants == 4000,
                 "Expected 4000 configured tenants");
 
+    // Create a flow for each tenant (just for the first 1000 we'll enqueue to)
+    hwfq_flow_id_t flow_ids[1000];
+    for (int i = 0; i < 1000; i++) {
+        flow_ids[i] = test_add_flow(scheduler, tenant_ids[i]);
+        TEST_ASSERT(flow_ids[i] != 0, "Failed to add flow");
+    }
+
     // Enqueue work to some tenants
     printf("    Enqueuing work to tenants...\n");
     for (int i = 0; i < 1000; i++) {
@@ -118,7 +125,7 @@ void test_4000_tenants(void) {
             .work_size = 4096,
             .timestamp = 0
         };
-        ret = hwfq_enqueue(scheduler, tenant_ids[i % 4000], 1, &work);
+        ret = hwfq_enqueue(scheduler, tenant_ids[i], flow_ids[i], &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to enqueue work");
     }
 
@@ -219,21 +226,25 @@ void test_memory_budget(void) {
            peak_tenant_bytes / (1024.0 * 1024.0),
            within_budget ? "<" : ">=");
 
-    // Test dynamic flow creation (flows created on-demand during enqueue)
+    // Test dynamic flow creation (flows created via hwfq_add_flow)
     printf("\n    Testing dynamic flow creation...\n");
     int flows_created = 0;
+    hwfq_flow_id_t test_flow_ids[100][100];  // [tenant][flow]
     for (int t = 0; t < 100; t++) {  // Test subset of tenants
-        for (int f = 1; f <= 100; f++) {
-            hwfq_session_t work = {
-                .user_data = (void*)(uintptr_t)(t * 100 + f),
-                .work_size = 4096,
-                .timestamp = 0
-            };
-            ret = hwfq_enqueue(scheduler, tenant_ids[t], f, &work);
-            if (ret == HWFQ_SUCCESS) flows_created++;
+        for (int f = 0; f < 100; f++) {
+            test_flow_ids[t][f] = test_add_flow(scheduler, tenant_ids[t]);
+            if (test_flow_ids[t][f] != 0) {
+                hwfq_session_t work = {
+                    .user_data = (void*)(uintptr_t)(t * 100 + f),
+                    .work_size = 4096,
+                    .timestamp = 0
+                };
+                ret = hwfq_enqueue(scheduler, tenant_ids[t], test_flow_ids[t][f], &work);
+                if (ret == HWFQ_SUCCESS) flows_created++;
+            }
         }
     }
-    printf("    Created %d flows dynamically via enqueue\n", flows_created);
+    printf("    Created %d flows dynamically via hwfq_add_flow\n", flows_created);
 
     // Drain all work
     for (int i = 0; i < flows_created; i++) {
@@ -280,14 +291,18 @@ void test_multi_tenant_operations(void) {
     int ret = hwfq_init(&config, &scheduler);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to create scheduler");
 
-    // Add 1000 tenants
+    // Add 1000 tenants, each with 5 flows
     hwfq_tenant_id_t tenant_ids[1000];
+    hwfq_flow_id_t flow_ids[1000][5];
     for (int i = 0; i < 1000; i++) {
         hwfq_allocation_t alloc = {
             .allocation_type = HWFQ_ALLOCATION_WEIGHT,
             .weight = 100
         };
         hwfq_add_tenant(scheduler, &alloc, &tenant_ids[i]);
+        for (int f = 0; f < 5; f++) {
+            flow_ids[i][f] = test_add_flow(scheduler, tenant_ids[i]);
+        }
     }
 
     // Enqueue work to all tenants
@@ -299,7 +314,7 @@ void test_multi_tenant_operations(void) {
                 .work_size = 4096,
                 .timestamp = 0
             };
-            hwfq_enqueue(scheduler, tenant_ids[i], 1 + (j % 5), &work);
+            hwfq_enqueue(scheduler, tenant_ids[i], flow_ids[i][j % 5], &work);
         }
     }
 
@@ -368,14 +383,18 @@ void test_scale_performance(void) {
     int ret = hwfq_init(&config, &scheduler);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to create scheduler");
 
-    // Add tenants
+    // Add tenants with flows
     hwfq_tenant_id_t tenant_ids[4000];
+    hwfq_flow_id_t flow_ids[4000][10];  // Each tenant gets 10 flows
     for (int i = 0; i < 4000; i++) {
         hwfq_allocation_t alloc = {
             .allocation_type = HWFQ_ALLOCATION_WEIGHT,
             .weight = 100
         };
         hwfq_add_tenant(scheduler, &alloc, &tenant_ids[i]);
+        for (int f = 0; f < 10; f++) {
+            flow_ids[i][f] = test_add_flow(scheduler, tenant_ids[i]);
+        }
     }
 
     // Pre-fill with work
@@ -386,7 +405,7 @@ void test_scale_performance(void) {
                 .work_size = 4096,
                 .timestamp = 0
             };
-            hwfq_enqueue(scheduler, tenant_ids[i], 1, &work);
+            hwfq_enqueue(scheduler, tenant_ids[i], flow_ids[i][0], &work);
         }
     }
 
@@ -402,7 +421,7 @@ void test_scale_performance(void) {
             .work_size = 4096,
             .timestamp = 0
         };
-        hwfq_enqueue(scheduler, tenant_ids[i % 4000], 1 + (i % 10), &work);
+        hwfq_enqueue(scheduler, tenant_ids[i % 4000], flow_ids[i % 4000][i % 10], &work);
 
         // Dequeue
         hwfq_session_t work_out;

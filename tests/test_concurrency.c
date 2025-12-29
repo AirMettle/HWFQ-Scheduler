@@ -21,7 +21,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-// Global test counters
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
 
@@ -35,74 +34,17 @@ static int g_tests_failed = 0;
 #define NUM_FLOWS_PER_TENANT 10
 
 // ============================================================================
-// Portable Barrier Implementation (for macOS compatibility)
-// ============================================================================
-
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int count;
-    int target;
-    int generation;
-} portable_barrier_t;
-
-static int portable_barrier_init(portable_barrier_t *b, int count) {
-    b->count = 0;
-    b->target = count;
-    b->generation = 0;
-    if (pthread_mutex_init(&b->mutex, NULL) != 0) return -1;
-    if (pthread_cond_init(&b->cond, NULL) != 0) {
-        pthread_mutex_destroy(&b->mutex);
-        return -1;
-    }
-    return 0;
-}
-
-static void portable_barrier_destroy(portable_barrier_t *b) {
-    pthread_mutex_destroy(&b->mutex);
-    pthread_cond_destroy(&b->cond);
-}
-
-static void portable_barrier_wait(portable_barrier_t *b) {
-    pthread_mutex_lock(&b->mutex);
-    int gen = b->generation;
-    b->count++;
-    if (b->count >= b->target) {
-        b->count = 0;
-        b->generation++;
-        pthread_cond_broadcast(&b->cond);
-    } else {
-        while (gen == b->generation) {
-            pthread_cond_wait(&b->cond, &b->mutex);
-        }
-    }
-    pthread_mutex_unlock(&b->mutex);
-}
-
-// ============================================================================
-// Sleep helper (portable)
-// ============================================================================
-
-static void msleep(int ms) {
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
-}
-
-// ============================================================================
 // Shared Test State
 // ============================================================================
 
 typedef struct {
     hwfq_scheduler_t *scheduler;
     hwfq_tenant_id_t tenant_id;
+    hwfq_flow_id_t flow_ids[NUM_FLOWS_PER_TENANT];
 
-    // Synchronization
     portable_barrier_t start_barrier;
     pthread_mutex_t print_lock;
 
-    // Atomic counters
     atomic_uint_fast64_t enqueue_success;
     atomic_uint_fast64_t enqueue_fail;
     atomic_uint_fast64_t dequeue_success;
@@ -110,10 +52,8 @@ typedef struct {
     atomic_uint_fast64_t dequeue_fail;
     atomic_uint_fast64_t complete_count;
 
-    // Control
-    volatile int stop_flag;
+    atomic_int stop_flag;
 
-    // Error tracking
     atomic_uint_fast32_t error_count;
 } concurrency_state_t;
 
@@ -124,7 +64,6 @@ typedef struct {
 static int concurrency_state_init(concurrency_state_t *state, int num_threads) {
     memset(state, 0, sizeof(*state));
 
-    // Create scheduler
     hwfq_config_t config = {
         .max_tenants = 100,
         .max_flows_per_tenant = 1000,
@@ -143,7 +82,6 @@ static int concurrency_state_init(concurrency_state_t *state, int num_threads) {
         return -1;
     }
 
-    // Add a tenant
     hwfq_allocation_t alloc = {
         .allocation_type = HWFQ_ALLOCATION_WEIGHT,
         .weight = 100
@@ -154,20 +92,17 @@ static int concurrency_state_init(concurrency_state_t *state, int num_threads) {
         return -1;
     }
 
-    // Configure flows
-    for (int i = 1; i <= NUM_FLOWS_PER_TENANT; i++) {
+    for (int i = 0; i < NUM_FLOWS_PER_TENANT; i++) {
         hwfq_allocation_t flow_alloc = {
             .allocation_type = HWFQ_ALLOCATION_WEIGHT,
             .weight = 10
         };
-        hwfq_configure_flow(state->scheduler, state->tenant_id, (hwfq_flow_id_t)i, &flow_alloc);
+        hwfq_add_flow(state->scheduler, state->tenant_id, &flow_alloc, &state->flow_ids[i]);
     }
 
-    // Initialize synchronization
     portable_barrier_init(&state->start_barrier, num_threads);
     pthread_mutex_init(&state->print_lock, NULL);
 
-    // Initialize atomic counters
     atomic_store(&state->enqueue_success, 0);
     atomic_store(&state->enqueue_fail, 0);
     atomic_store(&state->dequeue_success, 0);
@@ -176,7 +111,7 @@ static int concurrency_state_init(concurrency_state_t *state, int num_threads) {
     atomic_store(&state->complete_count, 0);
     atomic_store(&state->error_count, 0);
 
-    state->stop_flag = 0;
+    atomic_store(&state->stop_flag, 0);
 
     return 0;
 }
@@ -206,12 +141,10 @@ static void *producer_thread_func(void *arg) {
     int thread_id = targ->thread_id;
     int ops = targ->operations;
 
-    // Wait for all threads to be ready
     portable_barrier_wait(&state->start_barrier);
 
-    for (int i = 0; i < ops && !state->stop_flag; i++) {
-        // Cycle through flows
-        hwfq_flow_id_t flow_id = (hwfq_flow_id_t)((i % NUM_FLOWS_PER_TENANT) + 1);
+    for (int i = 0; i < ops && !atomic_load(&state->stop_flag); i++) {
+        hwfq_flow_id_t flow_id = state->flow_ids[i % NUM_FLOWS_PER_TENANT];
 
         hwfq_session_t work = {
             .user_data = (void *)(uintptr_t)((thread_id << 24) | i),
@@ -234,10 +167,9 @@ static void *consumer_thread_func(void *arg) {
     thread_arg_t *targ = (thread_arg_t *)arg;
     concurrency_state_t *state = targ->state;
 
-    // Wait for all threads to be ready
     portable_barrier_wait(&state->start_barrier);
 
-    while (!state->stop_flag) {
+    while (!atomic_load(&state->stop_flag)) {
         hwfq_session_t work_out;
         hwfq_tenant_id_t tid;
         hwfq_flow_id_t fid;
@@ -246,12 +178,10 @@ static void *consumer_thread_func(void *arg) {
         if (ret == HWFQ_SUCCESS) {
             atomic_fetch_add(&state->dequeue_success, 1);
 
-            // Complete the work
             hwfq_complete(state->scheduler, &work_out, tid, fid, get_time_ns_bench());
             atomic_fetch_add(&state->complete_count, 1);
         } else if (ret == HWFQ_ERR_NO_WORK) {
             atomic_fetch_add(&state->dequeue_empty, 1);
-            // Brief spin before retry
             for (volatile int j = 0; j < 100; j++) { }
         } else {
             atomic_fetch_add(&state->dequeue_fail, 1);
@@ -267,14 +197,11 @@ static void *mixed_thread_func(void *arg) {
     int thread_id = targ->thread_id;
     int ops = targ->operations;
 
-    // Wait for all threads to be ready
     portable_barrier_wait(&state->start_barrier);
 
-    for (int i = 0; i < ops && !state->stop_flag; i++) {
-        // Alternate between enqueue and dequeue
+    for (int i = 0; i < ops && !atomic_load(&state->stop_flag); i++) {
         if (i % 2 == 0) {
-            // Enqueue
-            hwfq_flow_id_t flow_id = (hwfq_flow_id_t)((i % NUM_FLOWS_PER_TENANT) + 1);
+            hwfq_flow_id_t flow_id = state->flow_ids[i % NUM_FLOWS_PER_TENANT];
             hwfq_session_t work = {
                 .user_data = (void *)(uintptr_t)((thread_id << 24) | i),
                 .work_size = 1024,
@@ -288,7 +215,6 @@ static void *mixed_thread_func(void *arg) {
                 atomic_fetch_add(&state->enqueue_fail, 1);
             }
         } else {
-            // Dequeue
             hwfq_session_t work_out;
             hwfq_tenant_id_t tid;
             hwfq_flow_id_t fid;
@@ -320,14 +246,12 @@ static bool validate_final_state(concurrency_state_t *state) {
     uint64_t dequeued = atomic_load(&state->dequeue_success);
     uint64_t completed = atomic_load(&state->complete_count);
 
-    // Dequeued should equal completed
     if (dequeued != completed) {
         printf("      ERROR: dequeued (%lu) != completed (%lu)\n",
                (unsigned long)dequeued, (unsigned long)completed);
         valid = false;
     }
 
-    // Drain remaining items from queue
     uint64_t remaining = 0;
     hwfq_session_t work;
     hwfq_tenant_id_t tid;
@@ -338,14 +262,12 @@ static bool validate_final_state(concurrency_state_t *state) {
         hwfq_complete(state->scheduler, &work, tid, fid, get_time_ns_bench());
     }
 
-    // Verify accounting: enqueued = dequeued + remaining
     if (enqueued != dequeued + remaining) {
         printf("      ERROR: accounting mismatch: enqueued=%lu, dequeued=%lu, remaining=%lu\n",
                (unsigned long)enqueued, (unsigned long)dequeued, (unsigned long)remaining);
         valid = false;
     }
 
-    // Check for recorded errors
     if (atomic_load(&state->error_count) > 0) {
         printf("      ERROR: %u errors recorded during test\n",
                (unsigned int)atomic_load(&state->error_count));
@@ -375,7 +297,6 @@ void test_producer_only(void) {
     pthread_t threads[NUM_PRODUCER_THREADS];
     thread_arg_t args[NUM_PRODUCER_THREADS];
 
-    // Start producer threads
     for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
         args[i].state = &state;
         args[i].thread_id = i;
@@ -383,18 +304,15 @@ void test_producer_only(void) {
         pthread_create(&threads[i], NULL, producer_thread_func, &args[i]);
     }
 
-    // Wait for completion
     for (int i = 0; i < NUM_PRODUCER_THREADS; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    // Verify results
     uint64_t enqueued = atomic_load(&state.enqueue_success);
     uint64_t expected = (uint64_t)NUM_PRODUCER_THREADS * OPERATIONS_PER_THREAD;
     printf("      Enqueued: %lu (expected %lu)\n", (unsigned long)enqueued, (unsigned long)expected);
     TEST_ASSERT(enqueued == expected, "Not all enqueues succeeded");
 
-    // Drain queue
     uint64_t drained = 0;
     hwfq_session_t work;
     hwfq_tenant_id_t tid;
@@ -422,10 +340,9 @@ void test_consumer_only(void) {
     int ret = concurrency_state_init(&state, NUM_CONSUMER_THREADS);
     TEST_ASSERT(ret == 0, "Failed to initialize test state");
 
-    // Pre-fill the queue
     int prefill_count = OPERATIONS_PER_THREAD * 2;
     for (int i = 0; i < prefill_count; i++) {
-        hwfq_flow_id_t flow_id = (hwfq_flow_id_t)((i % NUM_FLOWS_PER_TENANT) + 1);
+        hwfq_flow_id_t flow_id = state.flow_ids[i % NUM_FLOWS_PER_TENANT];
         hwfq_session_t work = {
             .user_data = (void *)(uintptr_t)i,
             .work_size = 1024,
@@ -439,7 +356,6 @@ void test_consumer_only(void) {
     pthread_t threads[NUM_CONSUMER_THREADS];
     thread_arg_t args[NUM_CONSUMER_THREADS];
 
-    // Start consumer threads
     for (int i = 0; i < NUM_CONSUMER_THREADS; i++) {
         args[i].state = &state;
         args[i].thread_id = i;
@@ -447,18 +363,14 @@ void test_consumer_only(void) {
         pthread_create(&threads[i], NULL, consumer_thread_func, &args[i]);
     }
 
-    // Let consumers run for a bit
-    msleep(500);  // 500ms
+    msleep(500);
 
-    // Signal stop
-    state.stop_flag = 1;
+    atomic_store(&state.stop_flag, 1);
 
-    // Wait for completion
     for (int i = 0; i < NUM_CONSUMER_THREADS; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    // Verify
     uint64_t dequeued = atomic_load(&state.dequeue_success);
     uint64_t completed = atomic_load(&state.complete_count);
     printf("      Dequeued: %lu, Completed: %lu\n",
@@ -513,7 +425,7 @@ void test_mixed_producers_consumers(void) {
     msleep(100);  // 100ms
 
     // Signal stop
-    state.stop_flag = 1;
+    atomic_store(&state.stop_flag, 1);
 
     // Wait for consumers
     for (int i = 0; i < NUM_CONSUMER_THREADS; i++) {

@@ -2,7 +2,6 @@
 // Stress Tests for H-WFQ Scheduler
 // ============================================================================
 //
-// Story 5: Comprehensive Test Suite - Stress Testing
 // - High volume enqueue/dequeue cycles
 // - Rapid tenant/flow add/remove cycles
 // - Weight reconfiguration during operation
@@ -59,6 +58,9 @@ void stress_high_volume(void) {
     int ret = hwfq_add_tenant(scheduler, &alloc, &tenant_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add tenant");
 
+    hwfq_flow_id_t flow_id = test_add_flow(scheduler, tenant_id);
+    TEST_ASSERT(flow_id != 0, "Failed to add flow");
+
     #define HIGH_VOLUME_CYCLES 1000  // Reduced for faster test execution
 
     printf("    Running %d enqueue/dequeue cycles...\n", HIGH_VOLUME_CYCLES);
@@ -66,13 +68,13 @@ void stress_high_volume(void) {
     // Keep a small backlog to ensure scheduler stays active
     for (int i = 0; i < 100; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
     }
 
     BENCH_START();
     for (int i = 0; i < HIGH_VOLUME_CYCLES; i++) {
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        ret = hwfq_enqueue(scheduler, tenant_id, 1, &work);
+        ret = hwfq_enqueue(scheduler, tenant_id, flow_id, &work);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue failed during stress");
 
         hwfq_session_t work_out;
@@ -147,14 +149,14 @@ void stress_flow_churn(void) {
 
     BENCH_START();
     for (int i = 0; i < FLOW_CHURN_CYCLES; i++) {
-        hwfq_flow_id_t flow_id = 1 + (i % 1000);  // Cycle through flow IDs
         hwfq_allocation_t flow_alloc = {
             .allocation_type = HWFQ_ALLOCATION_WEIGHT,
             .weight = 50 + (i % 50)
         };
 
-        ret = hwfq_configure_flow(scheduler, tenant_id, flow_id, &flow_alloc);
-        TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to configure flow during churn");
+        hwfq_flow_id_t flow_id;
+        ret = hwfq_add_flow(scheduler, tenant_id, &flow_alloc, &flow_id);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add flow during churn");
 
         ret = hwfq_remove_flow(scheduler, tenant_id, flow_id);
         TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to remove flow during churn");
@@ -182,9 +184,10 @@ void stress_reconfiguration(void) {
     int ret = hwfq_add_tenant(scheduler, &alloc, &tenant_id);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to add tenant");
 
-    // Configure some flows
-    for (int f = 1; f <= 10; f++) {
-        hwfq_configure_flow(scheduler, tenant_id, f, &alloc);
+    // Add some flows
+    hwfq_flow_id_t flow_ids[10];
+    for (int f = 0; f < 10; f++) {
+        hwfq_add_flow(scheduler, tenant_id, &alloc, &flow_ids[f]);
     }
 
     #define RECONFIG_CYCLES 1000
@@ -192,10 +195,10 @@ void stress_reconfiguration(void) {
     printf("    Running %d cycles with weight reconfigurations...\n", RECONFIG_CYCLES);
 
     // Pre-enqueue
-    for (int f = 1; f <= 10; f++) {
+    for (int f = 0; f < 10; f++) {
         for (int i = 0; i < 100; i++) {
             hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-            hwfq_enqueue(scheduler, tenant_id, f, &work);
+            hwfq_enqueue(scheduler, tenant_id, flow_ids[f], &work);
         }
     }
 
@@ -203,8 +206,7 @@ void stress_reconfiguration(void) {
     for (int i = 0; i < RECONFIG_CYCLES; i++) {
         // Enqueue
         hwfq_session_t work = { .user_data = NULL, .work_size = 1024, .timestamp = 0 };
-        hwfq_flow_id_t flow = 1 + (i % 10);
-        hwfq_enqueue(scheduler, tenant_id, flow, &work);
+        hwfq_enqueue(scheduler, tenant_id, flow_ids[i % 10], &work);
 
         // Dequeue
         hwfq_session_t work_out;
@@ -219,7 +221,7 @@ void stress_reconfiguration(void) {
                 .allocation_type = HWFQ_ALLOCATION_WEIGHT,
                 .weight = 50 + (i / 100) % 100
             };
-            hwfq_reconfigure_flow(scheduler, tenant_id, 1 + (i / 100) % 10, &new_alloc);
+            hwfq_reconfigure_flow(scheduler, tenant_id, flow_ids[(i / 100) % 10], &new_alloc);
         }
     }
     BENCH_END();

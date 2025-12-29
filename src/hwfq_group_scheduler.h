@@ -13,41 +13,17 @@
 // WF2Q+ algorithm with a calendar queue data structure. It is generic and
 // can be instantiated multiple times to build hierarchical schedulers.
 //
-// Story 2: Provides single-level WFQ scheduling
-// Story 3: Will use this component at both system and tenant levels
-//
-// THREAD SAFETY:
-//   This component is NOT internally thread-safe. Callers must provide
-//   external synchronization if accessing a single group_scheduler_t instance
-//   from multiple threads. Multiple group_scheduler_t instances are safe to
-//   use concurrently without synchronization (no shared state).
-//
-//   Story 3 will handle synchronization at the hierarchical scheduler level.
-//
-// MEMORY OWNERSHIP:
-//   Sessions returned by group_scheduler_dequeue() must be freed by the caller
-//   using free(). Sessions removed by group_scheduler_remove_session() are
-//   freed internally. See function documentation for details.
-//
 // ============================================================================
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// ============================================================================
-// Opaque Types
-// ============================================================================
-
 // Group scheduler instance (single-level WFQ scheduler)
 typedef struct group_scheduler_t group_scheduler_t;
 
 // Session state (represents a queued work item)
 typedef struct session_state_t session_state_t;
-
-// ============================================================================
-// Type Definitions
-// ============================================================================
 
 // Generic entry ID (can represent tenant_id, flow_id, or any identifier)
 typedef uint32_t group_entry_id_t;
@@ -58,14 +34,10 @@ typedef struct {
     hwfq_allocation_t allocation; // Rate or weight-based allocation
 } group_entry_config_t;
 
-// ============================================================================
-// Group Scheduler Lifecycle
-// ============================================================================
+// Forward declaration for chunked entries
+typedef struct hwfq_chunked_entries_t hwfq_chunked_entries_t;
 
-// Forward declaration for entry pool
-typedef struct hwfq_entry_pool_t hwfq_entry_pool_t;
-
-// Initialize a group scheduler instance
+// Initialize a group scheduler instance with chunked entries storage
 //
 // parent - Parent scheduler (for memory allocation context)
 // num_groups - Number of service interval groups (typically 16)
@@ -73,34 +45,18 @@ typedef struct hwfq_entry_pool_t hwfq_entry_pool_t;
 // total_capacity - Total capacity in work units/sec
 // max_entries - Maximum entry ID + 1 (e.g., max_tenants for system scheduler,
 //               max_flows_per_tenant for tenant scheduler)
+// entries - Chunked entries storage (owned by caller, not freed on destroy)
 //
 // Returns pointer to group scheduler, or NULL on error
-group_scheduler_t *group_scheduler_init(hwfq_scheduler_t *parent, uint32_t num_groups,
-                                        uint32_t bins_per_group, uint64_t total_capacity,
-                                        uint32_t max_entries);
-
-// Initialize a group scheduler with shared entry pool
-//
-// Same as group_scheduler_init, but uses a shared entry pool instead of
-// allocating a local entries array. This saves memory when many schedulers
-// would otherwise pre-allocate large entry arrays.
-//
-// entry_pool - Shared entry pool for allocating entries on-demand (must not be NULL)
-//
-// Returns pointer to group scheduler, or NULL on error
-group_scheduler_t *group_scheduler_init_with_pool(hwfq_scheduler_t *parent, uint32_t num_groups,
-                                                   uint32_t bins_per_group, uint64_t total_capacity,
-                                                   uint32_t max_entries, hwfq_entry_pool_t *entry_pool);
+group_scheduler_t *group_scheduler_init_with_entries(hwfq_scheduler_t *parent, uint32_t num_groups,
+                                                       uint32_t bins_per_group, uint64_t total_capacity,
+                                                       uint32_t max_entries, hwfq_chunked_entries_t *entries);
 
 // Destroy a group scheduler and free all resources
 //
 // parent - Parent scheduler (for memory deallocation)
 // gs - Group scheduler to destroy
 void group_scheduler_destroy(hwfq_scheduler_t *parent, group_scheduler_t *gs);
-
-// ============================================================================
-// Entry Configuration
-// ============================================================================
 
 // Configure an entry in the group scheduler
 //
@@ -121,9 +77,9 @@ int group_scheduler_configure_entry(group_scheduler_t *gs, const group_entry_con
 // Returns 0 on success, negative error code on failure
 int group_scheduler_remove_entry(group_scheduler_t *gs, group_entry_id_t entry_id);
 
-// ============================================================================
-// Session Scheduling
-// ============================================================================
+// Internal cleanup callback type for session user_data during destroy
+// Called with parent scheduler for access to memory operations
+typedef void (*group_session_cleanup_fn)(hwfq_scheduler_t *parent, void *user_data);
 
 // Enqueue a session into the group scheduler
 //
@@ -135,11 +91,13 @@ int group_scheduler_remove_entry(group_scheduler_t *gs, group_entry_id_t entry_i
 // entry_id - Which entry this session belongs to
 // work_size - Size of work (in work units, e.g., bytes, operations)
 // user_data - User data pointer (stored in session, returned on dequeue)
+// cleanup_fn - Optional callback to cleanup user_data if session destroyed without dequeue
 // session_out - Output parameter for created session (optional)
 //
 // Returns 0 on success, negative error code on failure
 int group_scheduler_enqueue(group_scheduler_t *gs, group_entry_id_t entry_id, uint64_t work_size,
-                            void *user_data, session_state_t **session_out);
+                            void *user_data, group_session_cleanup_fn cleanup_fn,
+                            session_state_t **session_out);
 
 // Dequeue the next session according to WF2Q+ policy
 //
@@ -172,10 +130,6 @@ session_state_t *group_scheduler_dequeue(group_scheduler_t *gs);
 // Returns 0 on success, negative error code on failure
 int group_scheduler_remove_session(group_scheduler_t *gs, session_state_t *session);
 
-// ============================================================================
-// Virtual Time Management
-// ============================================================================
-
 // Get current virtual time
 //
 // Virtual time represents the progress of fair service delivery according
@@ -196,10 +150,6 @@ uint64_t group_scheduler_get_virtual_time(group_scheduler_t *gs);
 // work_completed - Amount of work completed (in work units)
 void group_scheduler_update_virtual_time(group_scheduler_t *gs, uint64_t work_completed);
 
-// ============================================================================
-// Session Data Access
-// ============================================================================
-
 // Get entry ID for a session
 group_entry_id_t session_get_entry_id(const session_state_t *session);
 
@@ -211,10 +161,6 @@ uint64_t session_get_work_size(const session_state_t *session);
 
 // Get finish time from a session
 uint64_t session_get_finish_time(const session_state_t *session);
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
 
 // Get number of active sessions in the scheduler
 uint32_t group_scheduler_get_session_count(group_scheduler_t *gs);

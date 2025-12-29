@@ -71,22 +71,19 @@ static void calculate_level_sizes(uint32_t max_flows,
     // For 64M flows, level2 needs only 1 word (with 4 bits used)
 }
 
-// ============================================================================
-// Trie Lifecycle Functions
-// ============================================================================
-
 int hwfq_flow_trie_init(hwfq_flow_trie_t *trie, uint32_t max_flows,
-                        void *(*alloc_fn)(size_t)) {
-    if (trie == NULL || max_flows == 0 || max_flows > HWFQ_TRIE_MAX_FLOWS) {
+                        void *(*alloc_fn)(size_t), void (*free_fn)(void *)) {
+    if (trie == NULL || max_flows == 0) {
         return HWFQ_ERR_INVALID_ARG;
     }
 
-    // Use malloc if no allocator provided
     if (alloc_fn == NULL) {
         alloc_fn = malloc;
     }
+    if (free_fn == NULL) {
+        free_fn = free;
+    }
 
-    // Calculate level sizes
     calculate_level_sizes(max_flows,
                           &trie->leaf_size,
                           &trie->level0_size,
@@ -96,7 +93,6 @@ int hwfq_flow_trie_init(hwfq_flow_trie_t *trie, uint32_t max_flows,
     trie->allocated_count = 0;
     trie->alloc_hint = 0;
 
-    // Allocate leaf level (1 bit per flow, 0=free, 1=allocated)
     size_t leaf_bytes = (size_t)trie->leaf_size * sizeof(uint64_t);
     trie->leaf = (uint64_t *)alloc_fn(leaf_bytes);
     if (trie->leaf == NULL) {
@@ -108,7 +104,7 @@ int hwfq_flow_trie_init(hwfq_flow_trie_t *trie, uint32_t max_flows,
     size_t level0_bytes = (size_t)trie->level0_size * sizeof(uint64_t);
     trie->level0 = (uint64_t *)alloc_fn(level0_bytes);
     if (trie->level0 == NULL) {
-        alloc_fn == malloc ? free(trie->leaf) : (void)0;
+        free_fn(trie->leaf);
         trie->leaf = NULL;
         return HWFQ_ERR_NO_MEMORY;
     }
@@ -119,8 +115,8 @@ int hwfq_flow_trie_init(hwfq_flow_trie_t *trie, uint32_t max_flows,
     size_t level1_bytes = (size_t)trie->level1_size * sizeof(uint64_t);
     trie->level1 = (uint64_t *)alloc_fn(level1_bytes);
     if (trie->level1 == NULL) {
-        alloc_fn == malloc ? free(trie->level0) : (void)0;
-        alloc_fn == malloc ? free(trie->leaf) : (void)0;
+        free_fn(trie->level0);
+        free_fn(trie->leaf);
         trie->level0 = NULL;
         trie->leaf = NULL;
         return HWFQ_ERR_NO_MEMORY;
@@ -209,16 +205,11 @@ void hwfq_flow_trie_destroy(hwfq_flow_trie_t *trie, void (*free_fn)(void *)) {
     trie->allocated_count = 0;
 }
 
-// ============================================================================
-// Allocation Functions
-// ============================================================================
-
 int hwfq_flow_trie_alloc(hwfq_flow_trie_t *trie, uint32_t *flow_id_out) {
     if (trie == NULL || flow_id_out == NULL) {
         return HWFQ_ERR_INVALID_ARG;
     }
 
-    // Check if any slots are free
     if (trie->level2 == 0) {
         return HWFQ_ERR_NO_MEMORY;  // All slots allocated
     }
@@ -252,12 +243,10 @@ int hwfq_flow_trie_alloc(hwfq_flow_trie_t *trie, uint32_t *flow_id_out) {
     }
     uint32_t flow_id = leaf_word_idx * 64 + (leaf_bit - 1);
 
-    // Validate flow_id
     if (flow_id >= trie->max_flows) {
         return HWFQ_ERR_NO_MEMORY;
     }
 
-    // Mark as allocated
     set_bit(trie->leaf, flow_id);
     trie->allocated_count++;
     *flow_id_out = flow_id;
@@ -298,7 +287,6 @@ void hwfq_flow_trie_free(hwfq_flow_trie_t *trie, uint32_t flow_id) {
     // Check if leaf word was full before freeing
     bool was_full = (trie->leaf[leaf_word_idx] == UINT64_MAX);
 
-    // Mark as free
     clear_bit(trie->leaf, flow_id);
     trie->allocated_count--;
 
@@ -318,10 +306,6 @@ void hwfq_flow_trie_free(hwfq_flow_trie_t *trie, uint32_t flow_id) {
         }
     }
 }
-
-// ============================================================================
-// Query Functions
-// ============================================================================
 
 bool hwfq_flow_trie_is_allocated(const hwfq_flow_trie_t *trie, uint32_t flow_id) {
     if (trie == NULL || flow_id >= trie->max_flows) {

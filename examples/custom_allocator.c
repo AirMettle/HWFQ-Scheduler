@@ -157,23 +157,24 @@ int main(void)
     printf("   Added 5 tenants\n");
     printf("   Current memory usage: %zu bytes\n\n", g_memory_tracker.current_usage);
 
-    // Step 3: Configure flows within tenants
-    printf("3. Configuring flows...\n");
+    // Step 3: Add flows within tenants
+    printf("3. Adding flows...\n");
 
     for (uint32_t tenant = 0; tenant < 5; tenant++) {
         for (uint32_t flow = 0; flow < 3; flow++) {
             hwfq_allocation_t alloc = {.allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100};
+            hwfq_flow_id_t flow_id;
 
-            ret = hwfq_configure_flow(scheduler, tenant_ids[tenant], flow, &alloc);
+            ret = hwfq_add_flow(scheduler, tenant_ids[tenant], &alloc, &flow_id);
             if (ret != HWFQ_SUCCESS) {
-                fprintf(stderr, "Failed to configure flow: %d\n", ret);
+                fprintf(stderr, "Failed to add flow: %d\n", ret);
                 hwfq_destroy(scheduler);
                 return 1;
             }
         }
     }
 
-    printf("   Configured 15 flows (3 per tenant)\n");
+    printf("   Added 15 flows (3 per tenant)\n");
     printf("   Peak memory usage: %zu bytes\n\n", g_memory_tracker.peak_usage);
 
     // Step 4: Query capacity

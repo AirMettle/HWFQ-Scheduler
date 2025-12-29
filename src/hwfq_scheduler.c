@@ -5,33 +5,37 @@
 // This file implements the hierarchical scheduling API that combines the
 // system-level scheduler (for tenants) with tenant-level schedulers (for flows).
 //
-// Story 3: Hierarchical Scheduler
-//
 // ============================================================================
 
 #include "hwfq_internal.h"
 #include "hwfq_group_scheduler.h"
-#include "hwfq_memory_pool.h"
+#include "hwfq_group_scheduler_internal.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-// ============================================================================
-// Constants
-// ============================================================================
-
 // Default work quantum for tenant sessions in system scheduler
 #define TENANT_QUANTUM_SIZE 4096
+
+// Cleanup callback for flow_scheduler sessions
+// Handles freeing flow_session_context_t and calling user's cleanup_fn
+static void flow_context_cleanup(hwfq_scheduler_t *parent, void *user_data)
+{
+    flow_session_context_t *context = (flow_session_context_t *)user_data;
+    if (context == NULL) {
+        return;
+    }
+    if (context->cleanup_fn != NULL) {
+        context->cleanup_fn(context->user_data);
+    }
+    hwfq_free(parent, context);
+}
 
 // Default weight for unconfigured flows
 #define DEFAULT_FLOW_WEIGHT 100
 
 // Rate calculation window (1 second in nanoseconds)
 #define RATE_WINDOW_NS (1000000000ULL)
-
-// ============================================================================
-// In-Flight Hash Table Helper Functions
-// ============================================================================
 
 // Hash function for user_data pointer (Knuth multiplicative hash)
 static inline uint32_t hash_user_data(void *user_data) {
@@ -42,12 +46,10 @@ static inline uint32_t hash_user_data(void *user_data) {
 
 // Insert entry into in-flight hash table and list
 static void in_flight_insert(hwfq_scheduler_t *scheduler, in_flight_entry_t *entry) {
-    // Insert into hash table
     uint32_t bucket = hash_user_data(entry->user_data);
     entry->hash_next = scheduler->in_flight_hash[bucket];
     scheduler->in_flight_hash[bucket] = entry;
 
-    // Append to doubly-linked list (for timeout scan)
     entry->list_next = NULL;
     entry->list_prev = scheduler->in_flight_tail;
     if (scheduler->in_flight_tail != NULL) {
@@ -60,7 +62,6 @@ static void in_flight_insert(hwfq_scheduler_t *scheduler, in_flight_entry_t *ent
 
 // Remove entry from in-flight hash table and list
 static void in_flight_remove(hwfq_scheduler_t *scheduler, in_flight_entry_t *entry) {
-    // Remove from hash table
     uint32_t bucket = hash_user_data(entry->user_data);
     in_flight_entry_t **prev = &scheduler->in_flight_hash[bucket];
     while (*prev != NULL) {
@@ -71,7 +72,6 @@ static void in_flight_remove(hwfq_scheduler_t *scheduler, in_flight_entry_t *ent
         prev = &(*prev)->hash_next;
     }
 
-    // Remove from doubly-linked list
     if (entry->list_prev != NULL) {
         entry->list_prev->list_next = entry->list_next;
     } else {
@@ -102,10 +102,6 @@ static in_flight_entry_t *in_flight_find(hwfq_scheduler_t *scheduler,
     }
     return NULL;
 }
-
-// ============================================================================
-// Statistics Helper Functions
-// ============================================================================
 
 // Get current time in nanoseconds (monotonic clock)
 static inline uint64_t get_time_ns(void) {
@@ -145,9 +141,9 @@ static void update_tenant_rate_tracking(tenant_config_t *tenant, uint64_t work_s
     }
 }
 
-// Update rate tracking for a flow
-static void update_flow_rate_tracking(flow_config_t *flow, uint64_t work_size, uint64_t now_ns) {
-    rate_tracking_t *rt = &flow->rate_tracking;
+// Update rate tracking for an entry (flow)
+static void update_entry_rate_tracking(entry_config_t *entry, uint64_t work_size, uint64_t now_ns) {
+    entry_rate_tracking_t *rt = &entry->rate_tracking;
 
     // If window hasn't started yet, initialize it
     if (rt->window_start_ns == 0) {
@@ -161,7 +157,7 @@ static void update_flow_rate_tracking(flow_config_t *flow, uint64_t work_size, u
     if (elapsed >= RATE_WINDOW_NS) {
         // Calculate rate for the completed window
         if (elapsed > 0) {
-            flow->stats.effective_rate = (double)rt->window_work_units * 1000000000.0 / (double)elapsed;
+            entry->stats.effective_rate = (double)rt->window_work_units * 1000000000.0 / (double)elapsed;
         }
         // Start new window
         rt->window_start_ns = now_ns;
@@ -171,76 +167,33 @@ static void update_flow_rate_tracking(flow_config_t *flow, uint64_t work_size, u
         rt->window_work_units += work_size;
         // Update rate estimate (running calculation)
         if (elapsed > 0) {
-            flow->stats.effective_rate = (double)rt->window_work_units * 1000000000.0 / (double)elapsed;
+            entry->stats.effective_rate = (double)rt->window_work_units * 1000000000.0 / (double)elapsed;
         }
     }
 }
 
-// Find flow in tenant's flow list
-static flow_config_t *find_flow_in_tenant(tenant_config_t *tenant, hwfq_flow_id_t flow_id) {
-    flow_config_t *flow = tenant->flows;
-    while (flow != NULL) {
-        if (flow->flow_id == flow_id) {
-            return flow;
-        }
-        flow = flow->next;
+// Find flow entry in tenant's chunked entries (direct O(1) lookup)
+static entry_config_t *find_flow_entry(tenant_config_t *tenant, hwfq_flow_id_t flow_id) {
+    entry_config_t *entry = hwfq_chunked_get(&tenant->flow_entries, flow_id);
+    if (entry != NULL && entry->configured) {
+        return entry;
     }
     return NULL;
 }
 
-// ============================================================================
-// Internal Helper Functions
-// ============================================================================
-
-// Ensure a flow entry exists in tenant's scheduler and flow config list
-// For unconfigured flows, creates a default weight-based entry
+// Ensure a flow entry exists in tenant's scheduler
+// Flow must have been created via hwfq_add_flow()
 static int ensure_flow_entry(hwfq_scheduler_t *scheduler,
                              tenant_config_t *tenant,
                              hwfq_flow_id_t flow_id)
 {
-    // Check if flow config already exists
-    flow_config_t *existing = find_flow_in_tenant(tenant, flow_id);
-    if (existing != NULL) {
-        // Flow already configured
+    (void)scheduler;  // unused
+
+    entry_config_t *entry = hwfq_chunked_get(&tenant->flow_entries, flow_id);
+    if (entry != NULL && entry->configured) {
         return HWFQ_SUCCESS;
     }
-
-    // Check if flow is already configured in the flow scheduler but not in our list
-    uint64_t rate_out;
-    int ret = group_scheduler_get_entry_rate(tenant->flow_scheduler, flow_id, &rate_out);
-    if (ret != HWFQ_SUCCESS) {
-        // Flow not configured in scheduler - create with default weight
-        group_entry_config_t flow_entry = {
-            .entry_id = flow_id,
-            .allocation = {
-                .allocation_type = HWFQ_ALLOCATION_WEIGHT,
-                .weight = DEFAULT_FLOW_WEIGHT
-            }
-        };
-
-        ret = group_scheduler_configure_entry(tenant->flow_scheduler, &flow_entry);
-        if (ret != HWFQ_SUCCESS) {
-            return ret;
-        }
-    }
-
-    // Create a flow_config_t for in-flight tracking
-    flow_config_t *flow = (flow_config_t *)hwfq_alloc(scheduler, sizeof(flow_config_t));
-    if (flow == NULL) {
-        return HWFQ_ERR_NO_MEMORY;
-    }
-    memset(flow, 0, sizeof(flow_config_t));
-    flow->flow_id = flow_id;
-    flow->allocation.allocation_type = HWFQ_ALLOCATION_WEIGHT;
-    flow->allocation.weight = DEFAULT_FLOW_WEIGHT;
-    flow->configured = false;  // Auto-created, not explicitly configured
-
-    // Add to tenant's flow list
-    flow->next = tenant->flows;
-    tenant->flows = flow;
-    tenant->num_flows++;
-
-    return HWFQ_SUCCESS;
+    return HWFQ_ERR_NOT_FOUND;
 }
 
 // Register tenant as having backlog in system scheduler
@@ -248,17 +201,18 @@ static int register_tenant_backlog(hwfq_scheduler_t *scheduler,
                                    tenant_config_t *tenant)
 {
     if (tenant->has_backlog) {
-        // Already registered
         return HWFQ_SUCCESS;
     }
 
     // Enqueue a session for this tenant in the system scheduler
     // Use TENANT_QUANTUM_SIZE as representative work size
+    // No cleanup needed - tenant pointer is not allocated here
     int ret = group_scheduler_enqueue(
         scheduler->system_scheduler,
         tenant->tenant_id,
         TENANT_QUANTUM_SIZE,
-        tenant,  // user_data = tenant pointer for identification
+        tenant,
+        NULL,  // No cleanup for tenant sessions
         &tenant->tenant_session);
 
     if (ret == HWFQ_SUCCESS) {
@@ -268,10 +222,6 @@ static int register_tenant_backlog(hwfq_scheduler_t *scheduler,
     return ret;
 }
 
-
-// ============================================================================
-// Public API Implementations
-// ============================================================================
 
 int hwfq_enqueue(hwfq_scheduler_t *scheduler,
                  hwfq_tenant_id_t tenant_id,
@@ -292,22 +242,16 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler,
     }
 
     pthread_mutex_lock(&scheduler->lock);
-
-    // Get tenant
     tenant_config_t *tenant = scheduler->tenants[tenant_id];
     if (tenant == NULL || !tenant->configured) {
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NOT_FOUND;
     }
-
-    // Ensure flow entry exists (auto-create if needed)
     int ret = ensure_flow_entry(scheduler, tenant, flow_id);
     if (ret != HWFQ_SUCCESS) {
         pthread_mutex_unlock(&scheduler->lock);
         return ret;
     }
-
-    // Allocate flow session context
     flow_session_context_t *context = (flow_session_context_t *)hwfq_alloc(
         scheduler, sizeof(flow_session_context_t));
     if (context == NULL) {
@@ -321,27 +265,23 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler,
     context->work_size = work->work_size;
     context->enqueue_time_ns = 0;  // Set below if stats enabled
     context->timeout_ns = work->timeout_ns;
+    context->cleanup_fn = work->cleanup_fn;
 
-    // Record enqueue timestamp and update backlog counters (if stats enabled)
     if (scheduler->config.enable_statistics) {
         context->enqueue_time_ns = get_time_ns();
-
-        // Update backlog counters
         tenant->stats.current_backlog++;
-
-        // Find the flow and update its backlog counter
-        flow_config_t *flow = find_flow_in_tenant(tenant, flow_id);
-        if (flow != NULL) {
-            flow->stats.current_backlog++;
+        entry_config_t *flow_entry = find_flow_entry(tenant, flow_id);
+        if (flow_entry != NULL) {
+            flow_entry->stats.current_backlog++;
         }
     }
 
-    // Enqueue to tenant's flow scheduler
     ret = group_scheduler_enqueue(
         tenant->flow_scheduler,
         flow_id,
         work->work_size,
         context,
+        flow_context_cleanup,
         NULL);
 
     if (ret != HWFQ_SUCCESS) {
@@ -350,17 +290,13 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler,
         return ret;
     }
 
-    // Register tenant backlog in system scheduler if needed
     if (!tenant->has_backlog) {
         ret = register_tenant_backlog(scheduler, tenant);
-        if (ret != HWFQ_SUCCESS) {
-            // Rollback: would need to remove the session from flow scheduler
-            // For now, just log and continue - tenant will be picked up eventually
-            // This is a rare edge case
-        }
+        // Note: If registration fails (rare, memory pressure), the work is queued
+        // in flow_scheduler but tenant won't be scheduled until a subsequent
+        // enqueue succeeds. This is acceptable - the work is not lost.
     }
 
-    // Check if we should notify that work is available
     bool should_notify = false;
     if (scheduler->config.session_available_fn != NULL &&
         scheduler->in_flight_work_size < scheduler->config.total_capacity) {
@@ -369,7 +305,6 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler,
 
     pthread_mutex_unlock(&scheduler->lock);
 
-    // Call callback outside lock to avoid deadlock
     if (should_notify) {
         scheduler->config.session_available_fn(scheduler);
     }
@@ -388,44 +323,35 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
 
     pthread_mutex_lock(&scheduler->lock);
 
-    // Check if system scheduler has work
     if (group_scheduler_is_empty(scheduler->system_scheduler)) {
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NO_WORK;
     }
 
-    // Dequeue from system scheduler to get winning tenant
     session_state_t *tenant_session = group_scheduler_dequeue(scheduler->system_scheduler);
     if (tenant_session == NULL) {
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NO_WORK;
     }
 
-    // Get winning tenant from session user_data
     tenant_config_t *tenant = (tenant_config_t *)session_get_user_data(tenant_session);
     if (tenant == NULL) {
-        // Internal error - should not happen
         hwfq_free(scheduler, tenant_session);
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_INTERNAL;
     }
 
-    // Mark tenant as no longer having backlog (we just dequeued its session)
     tenant->has_backlog = false;
     tenant->tenant_session = NULL;
 
-    // Free the tenant session (we own it after dequeue)
     hwfq_free(scheduler, tenant_session);
 
-    // Dequeue from tenant's flow scheduler to get winning flow
     session_state_t *flow_session = group_scheduler_dequeue(tenant->flow_scheduler);
     if (flow_session == NULL) {
-        // Tenant had no flow work - inconsistent state
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_INTERNAL;
     }
 
-    // Extract context
     flow_session_context_t *context = (flow_session_context_t *)session_get_user_data(flow_session);
     if (context == NULL) {
         hwfq_free(scheduler, flow_session);
@@ -433,21 +359,16 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
         return HWFQ_ERR_INTERNAL;
     }
 
-    // Check capacity - if adding this work would exceed total_capacity, reject
     if (scheduler->config.total_capacity > 0 &&
         scheduler->in_flight_work_size + context->work_size > scheduler->config.total_capacity) {
-        // At capacity - re-enqueue the work for later
-        // Re-register tenant backlog since we still have work
         register_tenant_backlog(scheduler, tenant);
-        // Re-enqueue the flow session (put it back)
         group_scheduler_enqueue(tenant->flow_scheduler, context->flow_id,
-                                context->work_size, context, NULL);
+                                context->work_size, context, flow_context_cleanup, NULL);
         hwfq_free(scheduler, flow_session);
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NO_WORK;
     }
 
-    // Prepare output
     work_out->user_data = context->user_data;
     work_out->work_size = context->work_size;
     work_out->timestamp = context->enqueue_time_ns;  // Return enqueue time if tracked
@@ -459,14 +380,12 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
         *flow_id_out = context->flow_id;
     }
 
-    // Add to global in-flight hash table and list
     uint64_t dequeue_time = get_time_ns();
     in_flight_entry_t *entry = (in_flight_entry_t *)hwfq_alloc(scheduler, sizeof(in_flight_entry_t));
     if (entry == NULL) {
-        // Memory allocation failed - re-enqueue work
         register_tenant_backlog(scheduler, tenant);
         group_scheduler_enqueue(tenant->flow_scheduler, context->flow_id,
-                                context->work_size, context, NULL);
+                                context->work_size, context, flow_context_cleanup, NULL);
         hwfq_free(scheduler, flow_session);
         pthread_mutex_unlock(&scheduler->lock);
         return HWFQ_ERR_NO_MEMORY;
@@ -478,32 +397,23 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
     entry->dequeue_time_ns = dequeue_time;
     entry->timeout_ns = context->timeout_ns;
     entry->user_data = context->user_data;
-
-    // Insert into hash table and doubly-linked list
     in_flight_insert(scheduler, entry);
-
-    // Update capacity tracking
     scheduler->in_flight_work_size += context->work_size;
     scheduler->in_flight_count++;
-
-    // Update wait time stats
     if (scheduler->config.enable_statistics) {
-        flow_config_t *flow = find_flow_in_tenant(tenant, context->flow_id);
-        if (flow != NULL) {
+        entry_config_t *flow_entry = find_flow_entry(tenant, context->flow_id);
+        if (flow_entry != NULL) {
             uint64_t wait_time_ns = 0;
             if (context->enqueue_time_ns > 0) {
                 wait_time_ns = dequeue_time - context->enqueue_time_ns;
             }
             tenant->stats.total_wait_time_ns += wait_time_ns;
-            flow->stats.total_wait_time_ns += wait_time_ns;
+            flow_entry->stats.total_wait_time_ns += wait_time_ns;
         }
     }
 
-    // Free the context and flow_session (info is now in in_flight_entry)
     hwfq_free(scheduler, context);
     hwfq_free(scheduler, flow_session);
-
-    // Re-register tenant if there's still more work in its flow scheduler
     if (!group_scheduler_is_empty(tenant->flow_scheduler)) {
         register_tenant_backlog(scheduler, tenant);
     }
@@ -524,15 +434,12 @@ void hwfq_complete(hwfq_scheduler_t *scheduler,
 
     pthread_mutex_lock(&scheduler->lock);
 
-    // Find in hash table (O(1) lookup)
     void *user_data = (work != NULL) ? work->user_data : NULL;
     in_flight_entry_t *found = NULL;
 
     if (user_data != NULL) {
-        // Fast path: use hash lookup
         found = in_flight_find(scheduler, user_data, tenant_id, flow_id);
     } else {
-        // Slow path: must scan list if no user_data provided
         in_flight_entry_t *entry = scheduler->in_flight_head;
         while (entry != NULL) {
             if (entry->tenant_id == tenant_id && entry->flow_id == flow_id) {
@@ -544,63 +451,48 @@ void hwfq_complete(hwfq_scheduler_t *scheduler,
     }
 
     if (found == NULL) {
-        // Entry not found - nothing to complete
         pthread_mutex_unlock(&scheduler->lock);
         return;
     }
 
-    // Remove from hash table and list
     in_flight_remove(scheduler, found);
-
-    // Update capacity tracking
     scheduler->in_flight_work_size -= found->work_size;
     scheduler->in_flight_count--;
 
-    // Get tenant and flow for statistics
     tenant_config_t *tenant = NULL;
-    flow_config_t *flow = NULL;
+    entry_config_t *flow_entry = NULL;
 
     if (tenant_id < scheduler->config.max_tenants) {
         tenant = scheduler->tenants[tenant_id];
         if (tenant != NULL && tenant->configured) {
-            flow = find_flow_in_tenant(tenant, flow_id);
+            flow_entry = find_flow_entry(tenant, flow_id);
         }
     }
 
-    // Update statistics
     if (scheduler->config.enable_statistics && tenant != NULL) {
-        // Update work counters
         tenant->stats.work_units_processed += found->work_size;
         tenant->stats.operations_completed++;
-
-        if (flow != NULL) {
-            flow->stats.work_units_processed += found->work_size;
-            flow->stats.operations_completed++;
+        if (flow_entry != NULL) {
+            flow_entry->stats.work_units_processed += found->work_size;
+            flow_entry->stats.operations_completed++;
         }
-
-        // Decrement backlog counters
         if (tenant->stats.current_backlog > 0) {
             tenant->stats.current_backlog--;
         }
-        if (flow != NULL && flow->stats.current_backlog > 0) {
-            flow->stats.current_backlog--;
+        if (flow_entry != NULL && flow_entry->stats.current_backlog > 0) {
+            flow_entry->stats.current_backlog--;
         }
-
-        // Update rate tracking
         update_tenant_rate_tracking(tenant, found->work_size, completion_time_ns);
-        if (flow != NULL) {
-            update_flow_rate_tracking(flow, found->work_size, completion_time_ns);
+        if (flow_entry != NULL) {
+            update_entry_rate_tracking(flow_entry, found->work_size, completion_time_ns);
         }
     }
 
-    // Free in-flight entry
     hwfq_free(scheduler, found);
 
-    // Check if capacity now available and there's more work queued
     bool has_capacity = scheduler->in_flight_work_size < scheduler->config.total_capacity;
     bool has_work = !group_scheduler_is_empty(scheduler->system_scheduler);
 
-    // Also check if the tenant we just completed has more work
     if (tenant != NULL && !group_scheduler_is_empty(tenant->flow_scheduler)) {
         register_tenant_backlog(scheduler, tenant);
         has_work = true;
@@ -608,7 +500,6 @@ void hwfq_complete(hwfq_scheduler_t *scheduler,
 
     pthread_mutex_unlock(&scheduler->lock);
 
-    // Call callback outside lock to avoid deadlock
     if (has_capacity && has_work && scheduler->config.session_available_fn != NULL) {
         scheduler->config.session_available_fn(scheduler);
     }
@@ -625,15 +516,12 @@ int hwfq_cancel(hwfq_scheduler_t *scheduler,
 
     pthread_mutex_lock(&scheduler->lock);
 
-    // Find in hash table (O(1) lookup)
     void *user_data = (work != NULL) ? work->user_data : NULL;
     in_flight_entry_t *found = NULL;
 
     if (user_data != NULL) {
-        // Fast path: use hash lookup
         found = in_flight_find(scheduler, user_data, tenant_id, flow_id);
     } else {
-        // Slow path: must scan list if no user_data provided
         in_flight_entry_t *entry = scheduler->in_flight_head;
         while (entry != NULL) {
             if (entry->tenant_id == tenant_id && entry->flow_id == flow_id) {
@@ -649,14 +537,9 @@ int hwfq_cancel(hwfq_scheduler_t *scheduler,
         return HWFQ_ERR_NOT_FOUND;
     }
 
-    // Remove from hash table and list
     in_flight_remove(scheduler, found);
-
-    // Update capacity tracking
     scheduler->in_flight_work_size -= found->work_size;
     scheduler->in_flight_count--;
-
-    // Check if we should notify
     bool has_capacity = scheduler->in_flight_work_size < scheduler->config.total_capacity;
     bool has_work = !group_scheduler_is_empty(scheduler->system_scheduler);
 
@@ -664,7 +547,6 @@ int hwfq_cancel(hwfq_scheduler_t *scheduler,
 
     hwfq_free(scheduler, found);
 
-    // Call callback outside lock (no stats update - this is explicit cancel)
     if (has_capacity && has_work && scheduler->config.session_available_fn != NULL) {
         scheduler->config.session_available_fn(scheduler);
     }
@@ -682,16 +564,12 @@ uint32_t hwfq_check_timeouts(hwfq_scheduler_t *scheduler, uint64_t current_time_
 
     uint32_t timeout_count = 0;
 
-    // Walk the doubly-linked list (using list_next/list_prev)
     in_flight_entry_t *entry = scheduler->in_flight_head;
-
-    // Collect timed-out entries (can't call callback while holding lock)
     in_flight_entry_t *timed_out_list = NULL;
 
     while (entry != NULL) {
         in_flight_entry_t *next = entry->list_next;
 
-        // Check if this session has timed out
         bool is_timed_out = false;
         if (entry->timeout_ns > 0) {
             uint64_t elapsed = current_time_ns - entry->dequeue_time_ns;
@@ -699,14 +577,9 @@ uint32_t hwfq_check_timeouts(hwfq_scheduler_t *scheduler, uint64_t current_time_
         }
 
         if (is_timed_out) {
-            // Remove from hash table and doubly-linked list
             in_flight_remove(scheduler, entry);
-
-            // Update capacity tracking
             scheduler->in_flight_work_size -= entry->work_size;
             scheduler->in_flight_count--;
-
-            // Add to timed-out list for callback (reuse hash_next as temp link)
             entry->hash_next = timed_out_list;
             timed_out_list = entry;
             timeout_count++;
@@ -714,13 +587,11 @@ uint32_t hwfq_check_timeouts(hwfq_scheduler_t *scheduler, uint64_t current_time_
         entry = next;
     }
 
-    // Check if we should notify session_available_fn
     bool has_capacity = scheduler->in_flight_work_size < scheduler->config.total_capacity;
     bool has_work = !group_scheduler_is_empty(scheduler->system_scheduler);
 
     pthread_mutex_unlock(&scheduler->lock);
 
-    // Call timeout callbacks outside lock
     while (timed_out_list != NULL) {
         in_flight_entry_t *e = timed_out_list;
         timed_out_list = e->hash_next;
@@ -737,7 +608,6 @@ uint32_t hwfq_check_timeouts(hwfq_scheduler_t *scheduler, uint64_t current_time_
         hwfq_free(scheduler, e);
     }
 
-    // Notify if capacity freed and work available
     if (timeout_count > 0 && has_capacity && has_work &&
         scheduler->config.session_available_fn != NULL) {
         scheduler->config.session_available_fn(scheduler);

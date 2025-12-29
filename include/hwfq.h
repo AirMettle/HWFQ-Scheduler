@@ -184,24 +184,24 @@ int hwfq_remove_tenant(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id);
 // Flow Configuration APIs
 // ============================================================================
 
-// Configure a flow's resource allocation within its tenant
+// Add a new flow to a tenant and get its assigned flow_id
+//
+// The scheduler assigns flow_ids (like tenant_ids), enabling direct array
+// indexing for O(1) lookups. Flow IDs are per-tenant (unique within a tenant).
 //
 // scheduler - Scheduler handle
-// tenant_id - Tenant owning this flow
-// flow_id - Flow identifier (e.g., process ID, thread ID)
+// tenant_id - Tenant to add flow to
 // allocation - Resource allocation within tenant's share
+// flow_id_out - Output: assigned flow_id
 // returns - 0 on success, negative error code on failure
-//
-// NOTE: If flow is not configured, it gets equal share with other
-//       unconfigured flows within the tenant.
-int hwfq_configure_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
-                        hwfq_flow_id_t flow_id, const hwfq_allocation_t *allocation);
+int hwfq_add_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
+                   const hwfq_allocation_t *allocation, hwfq_flow_id_t *flow_id_out);
 
 // Remove a flow configuration
 //
 // scheduler - Scheduler handle
 // tenant_id - Tenant owning this flow
-// flow_id - Flow identifier
+// flow_id - Flow identifier (from hwfq_add_flow)
 // returns - 0 on success, negative error code on failure
 int hwfq_remove_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
                      hwfq_flow_id_t flow_id);
@@ -242,8 +242,16 @@ int hwfq_reconfigure_flow(hwfq_scheduler_t *scheduler,
 int hwfq_get_capacity_info(hwfq_scheduler_t *scheduler, hwfq_capacity_info_t *capacity_info_out);
 
 // ============================================================================
-// Scheduling APIs (Stubs for Future Implementation)
+// Scheduling APIs
 // ============================================================================
+//
+// Thread Safety: All scheduling APIs are thread-safe. The library uses internal
+// pthread mutexes to protect shared state. Multiple threads can safely call
+// enqueue, dequeue, complete, cancel, and check_timeouts concurrently.
+//
+
+// Cleanup callback for session user_data (called if session destroyed without dequeue)
+typedef void (*hwfq_session_cleanup_fn)(void *user_data);
 
 // Session to be scheduled
 typedef struct {
@@ -251,6 +259,7 @@ typedef struct {
     size_t work_size;   // Size of work (bytes, ops, etc.)
     uint64_t timestamp; // Enqueue timestamp (optional)
     uint64_t timeout_ns; // Per-session timeout in nanoseconds (0 = no timeout)
+    hwfq_session_cleanup_fn cleanup_fn; // Called to free user_data if session destroyed without dequeue (optional)
 } hwfq_session_t;
 
 // Enqueue work for scheduling
@@ -269,7 +278,7 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id, hwfq_f
 // work_out - Output parameter for next session
 // tenant_id_out - Output parameter for tenant ID (optional, can be NULL)
 // flow_id_out - Output parameter for flow ID (optional, can be NULL)
-// returns - 0 on success, -EAGAIN if no work available, negative error code on failure
+// returns - 0 on success, HWFQ_ERR_NO_WORK if no work available, negative error code on failure
 int hwfq_dequeue(hwfq_scheduler_t *scheduler, hwfq_session_t *work_out,
                  hwfq_tenant_id_t *tenant_id_out, hwfq_flow_id_t *flow_id_out);
 

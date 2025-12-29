@@ -2,10 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ============================================================================
-// Memory Management Implementation
-// ============================================================================
-
 void *hwfq_alloc(hwfq_scheduler_t *scheduler, size_t size)
 {
     if (scheduler == NULL || size == 0) {

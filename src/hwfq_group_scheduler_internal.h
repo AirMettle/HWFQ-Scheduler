@@ -2,6 +2,7 @@
 #define HWFQ_GROUP_SCHEDULER_INTERNAL_H
 
 #include "hwfq_group_scheduler.h"
+#include "hwfq_chunked_entries.h"
 #include "hwfq_internal.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -32,159 +33,64 @@
 // down to preserve relative ordering while preventing overflow.
 #define HWFQ_REBASE_THRESHOLD (UINT64_MAX / 2)
 
-// ============================================================================
-// Internal Data Structures for Group Scheduler
-// ============================================================================
+// Internal cleanup callback for session user_data during destroy
+// Called with parent scheduler for access to free_fn
+typedef void (*session_cleanup_fn)(hwfq_scheduler_t *parent, void *user_data);
 
-// ============================================================================
-// Session State
-// ============================================================================
-
-// Session state represents a queued work item in the scheduler
-// This is the actual structure definition (opaque in public API)
 struct session_state_t {
-    // Ownership
-    group_entry_id_t entry_id; // Which entry owns this session
-
-    // WF2Q+ timing information (all times scaled by TIME_SCALE_FACTOR)
-    uint64_t start_time;       // S_i (virtual start time, scaled)
-    uint64_t finish_time;      // F_i (virtual finish time, scaled)
-    uint64_t service_interval; // Φ_i = (L << shift) / r_i (scaled)
-
-    // Calendar queue position
-    uint32_t group_index; // Service interval group (0-15)
-    uint32_t bin_index;   // Bin within group
-
-    // User data
-    void *user_data;    // User-provided data pointer
-    uint64_t work_size; // L (work size in work units)
-
-    // Doubly-linked list within bin (sorted by finish_time, then start_time)
-    struct session_state_t *bin_next;  // Next session in same bin
-    struct session_state_t *bin_prev;  // Previous session in same bin
-
-    // Metadata
-    uint64_t enqueue_time_ns; // When session was enqueued
+    group_entry_id_t entry_id;
+    uint64_t start_time;
+    uint64_t finish_time;
+    uint64_t service_interval;
+    uint32_t group_index;
+    uint32_t bin_index;
+    void *user_data;
+    uint64_t work_size;
+    struct session_state_t *bin_next;
+    struct session_state_t *bin_prev;
+    uint64_t enqueue_time_ns;
+    session_cleanup_fn cleanup_fn;
 };
 
-// ============================================================================
-// Entry Configuration
-// ============================================================================
+typedef struct entry_rate_tracking_t {
+    uint64_t window_start_ns;
+    uint64_t window_work_units;
+} entry_rate_tracking_t;
 
-// Per-entry state and configuration
 typedef struct entry_config_t {
     group_entry_id_t entry_id;
     bool configured;
-
-    // Allocation configuration
-    hwfq_allocation_t allocation; // Rate or weight-based
-
-    // Calculated rate (for weight-based, computed dynamically)
+    hwfq_allocation_t allocation;
     uint64_t calculated_rate;
-
-    // Last finish time for this entry's sessions
-    // Used to calculate start time for next session: S_i = max(V, last_F_i)
     uint64_t last_finish_time;
-
-    // Linked list for configured entries (optimization for weight recalculation)
     struct entry_config_t *next_configured;
-
-    // Hash chain for entry lookup (when using shared pool)
-    struct entry_config_t *hash_next;
-
+    hwfq_flow_stats_t stats;
+    entry_rate_tracking_t rate_tracking;
 } entry_config_t;
 
-
-// ============================================================================
-// Group Scheduler Structure
-// ============================================================================
-
-// Group scheduler instance
-// This implements a single-level WFQ scheduler with calendar queue
 struct group_scheduler_t {
-    // ========================================================================
-    // Calendar Queue Data Structures
-    // ========================================================================
-
-    // Bin bitfield (one bit per bin, indicating if bin has sessions)
-    // Total bins = num_groups × bins_per_group (e.g., 16 × 2048 = 32768)
-    // Bitfield size = 32768 / 32 = 1024 uint32_t words
     uint32_t *bin_bitfield;
-
-    // Linked list heads for each bin (sorted by finish_time, then start_time)
-    // bin_heads[bin_index] points to the first session in that bin (minimum finish_time)
     session_state_t **bin_heads;
-
-    // Hierarchical group bitfield (one bit per group of 32 bins)
-    // For 32K bins, we have 1024 groups, needing 32 uint32_t words
     uint32_t group_bitfield[32];
-
-    // ========================================================================
-    // Entry Management
-    // ========================================================================
-
-    // Entry configurations - two modes:
-    // 1. Local array (entries != NULL, entry_pool == NULL): for system scheduler
-    //    Entries indexed directly by entry_id
-    // 2. Shared pool (entries == NULL, entry_pool != NULL): for flow schedulers
-    //    Entries allocated on-demand from shared pool
-    entry_config_t *entries;          // Local array (NULL if using pool)
-    hwfq_entry_pool_t *entry_pool;    // Shared pool (NULL if using local array)
-    uint32_t max_entries;             // Max entries limit
-
-    // Hash table for entry lookup when using shared pool
-    // Maps entry_id -> entry_config_t*
-    // Only used when entry_pool != NULL
-    #define ENTRY_HASH_SIZE 64
-    entry_config_t *entry_hash[ENTRY_HASH_SIZE];
-    uint32_t entry_count;             // Number of configured entries
-
-    // Linked list of configured entries (for efficient iteration)
+    hwfq_chunked_entries_t *entries;
+    uint32_t max_entries;
     entry_config_t *configured_entries_head;
-
-    // Tracking for rate/weight calculations
-    uint64_t allocated_rate_capacity; // Sum of rate-based allocations
-    uint32_t total_weight;            // Sum of weight-based allocations
-
-    // ========================================================================
-    // Configuration
-    // ========================================================================
-
-    uint32_t num_groups;        // Number of service interval groups
-    uint32_t bins_per_group;    // Bins per group
-    uint32_t num_bins;          // Total bins (num_groups × bins_per_group)
-    uint32_t bin_bitfield_size; // Size of bin_bitfield array
-
-    uint64_t base_interval;  // Φ_min (minimum service interval)
-    uint64_t total_capacity; // Total capacity in work units/sec
-
-    // ========================================================================
-    // WF2Q+ State
-    // ========================================================================
-
-    uint64_t virtual_time;         // V_WF2Q+(t) - current virtual time (scaled)
-    uint32_t active_session_count; // Number of sessions in queue
-    uint64_t min_finish_time;      // Cached minimum finish time (scaled)
-    uint64_t min_start_time; // Cached minimum start time (scaled) for O(1) virtual time update
-    session_state_t *min_session;  // Cached pointer to minimum session
-
-    // ========================================================================
-    // Thread Safety
-    // ========================================================================
-
-    pthread_mutex_t lock;  // Protects all scheduler state
-
-    // ========================================================================
-    // Parent Context
-    // ========================================================================
-
-    // Parent scheduler (for memory allocation)
+    uint64_t allocated_rate_capacity;
+    uint32_t total_weight;
+    uint32_t num_groups;
+    uint32_t bins_per_group;
+    uint32_t num_bins;
+    uint32_t bin_bitfield_size;
+    uint64_t base_interval;
+    uint64_t total_capacity;
+    uint64_t virtual_time;
+    uint32_t active_session_count;
+    uint64_t min_finish_time;
+    uint64_t min_start_time;
+    session_state_t *min_session;
+    pthread_mutex_t lock;
     hwfq_scheduler_t *parent;
 };
-
-// ============================================================================
-// Internal Helper Functions
-// ============================================================================
 
 // Calculate effective rate for an entry
 // For rate-based: returns configured rate
@@ -225,22 +131,12 @@ uint32_t find_first_set_bit(uint32_t value);
 // Called when weights change (entry added/removed/reconfigured)
 void recalculate_weight_based_rates(group_scheduler_t *gs);
 
-// ============================================================================
-// Entry Lookup Functions
-// ============================================================================
-
-// Hash function for entry IDs
-static inline uint32_t entry_id_hash(group_entry_id_t entry_id) {
-    return entry_id % ENTRY_HASH_SIZE;
-}
-
-// Find entry by ID - works for both local array and shared pool modes
+// Find entry by ID via direct chunked lookup
 // Returns NULL if entry not found/not configured
 entry_config_t *group_scheduler_find_entry(group_scheduler_t *gs, group_entry_id_t entry_id);
 
-// Get or create entry for configuration
-// For local array: returns pointer to array slot
-// For shared pool: allocates from pool if needed, adds to hash
-entry_config_t *group_scheduler_get_or_create_entry(group_scheduler_t *gs, group_entry_id_t entry_id);
+// Get entry by ID (assumes entry_id was allocated via hwfq_chunked_entries_alloc)
+// Returns NULL if entry not found
+entry_config_t *group_scheduler_get_entry(group_scheduler_t *gs, group_entry_id_t entry_id);
 
 #endif // HWFQ_GROUP_SCHEDULER_INTERNAL_H

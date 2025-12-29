@@ -23,7 +23,6 @@
 #include "test_common.h"
 #include "../src/hwfq_group_scheduler_internal.h"
 #include "../src/hwfq_internal.h"
-#include "../src/hwfq_memory_pool.h"
 #include "../include/hwfq.h"
 #include <stdlib.h>
 #include <string.h>
@@ -118,14 +117,28 @@ static hwfq_scheduler_t *create_test_scheduler(void) {
     return scheduler;
 }
 
-static group_scheduler_t *create_test_group_scheduler(hwfq_scheduler_t *parent) {
-    return group_scheduler_init(parent, 16, 2048, 1000000000ULL, 1000);
+static group_scheduler_t *create_export_group_scheduler(hwfq_scheduler_t *parent) {
+    return test_create_group_scheduler(parent, 16, 2048, 1000000000ULL, 1000);
+}
+
+// Store allocated entry IDs for use across phases
+static uint32_t g_entry_ids[NUM_ENTRIES];
+
+// Helper to find index from entry_id
+static int find_entry_index(uint32_t entry_id) {
+    for (int i = 0; i < NUM_ENTRIES; i++) {
+        if (g_entry_ids[i] == entry_id) return i;
+    }
+    return -1;
 }
 
 static void configure_geometric_entries(group_scheduler_t *gs) {
     for (int i = 0; i < NUM_ENTRIES; i++) {
+        // Allocate entry from chunked storage
+        test_alloc_entry(gs->entries, &g_entry_ids[i]);
+
         group_entry_config_t config = {
-            .entry_id = (uint32_t)i,
+            .entry_id = g_entry_ids[i],
             .allocation = {
                 .allocation_type = HWFQ_ALLOCATION_WEIGHT,
                 .weight = SKEW_WEIGHTS[i]
@@ -381,15 +394,16 @@ static phase_result_t run_phase(hwfq_scheduler_t *scheduler,
         // Enqueue for all active entries
         for (int i = first_active; i < NUM_ENTRIES; i++) {
             session_state_t *session = NULL;
-            group_scheduler_enqueue(gs, (uint32_t)i, 4096, NULL, &session);
+            group_scheduler_enqueue(gs, g_entry_ids[i], 4096, NULL, NULL, &session);
         }
 
         // Dequeue one session
         session_state_t *session = group_scheduler_dequeue(gs);
         if (session != NULL) {
             group_entry_id_t entry_id = session_get_entry_id(session);
-            if (entry_id < NUM_ENTRIES) {
-                dequeue_counts[entry_id]++;
+            int idx = find_entry_index(entry_id);
+            if (idx >= 0 && idx < NUM_ENTRIES) {
+                dequeue_counts[idx]++;
                 total_dequeues++;
             }
             group_scheduler_update_virtual_time(gs, session_get_work_size(session));
@@ -408,8 +422,8 @@ static phase_result_t run_phase(hwfq_scheduler_t *scheduler,
     // Populate entry results
     int entry_index = 0;
     for (int i = first_active; i < NUM_ENTRIES; i++) {
-        entry_result_t *e = &result.entries[entry_index++];
-        e->entry_id = (uint32_t)i;
+        entry_result_t *e = &result.entries[entry_index];
+        e->entry_id = (uint32_t)i;  // Use logical index for display
         e->weight = SKEW_WEIGHTS[i];
         e->expected_pct = (double)SKEW_WEIGHTS[i] / (double)result.total_weight * 100.0;
         e->actual_pct = (total_dequeues > 0) ?
@@ -417,6 +431,7 @@ static phase_result_t run_phase(hwfq_scheduler_t *scheduler,
         e->deviation_pct = (e->expected_pct > 0) ?
                            (e->actual_pct - e->expected_pct) / e->expected_pct * 100.0 : 0.0;
         e->dequeue_count = dequeue_counts[i];
+        entry_index++;
     }
 
     return result;
@@ -438,7 +453,7 @@ void test_skew_export_csv(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_export_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     configure_geometric_entries(gs);
@@ -461,7 +476,7 @@ void test_skew_export_csv(void) {
 
         // Remove previous entry (except for phase 1)
         if (phase > 1) {
-            group_scheduler_remove_entry(gs, (uint32_t)(phase - 2));
+            group_scheduler_remove_entry(gs, g_entry_ids[phase - 2]);
         }
 
         // Skip if no entries left
@@ -496,7 +511,7 @@ void test_skew_export_csv(void) {
     bool validation_passed = validate_all_phases(all_phases, num_phases, true);
     TEST_ASSERT(validation_passed, "Allocation validation failed - actual does not match theoretical");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -510,7 +525,7 @@ void test_csv_format(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_export_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     configure_geometric_entries(gs);
@@ -535,7 +550,7 @@ void test_csv_format(void) {
         TEST_ASSERT(e->expected_pct > 0, "Expected pct should be positive");
     }
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
@@ -556,7 +571,7 @@ void test_summary_export(void) {
     hwfq_scheduler_t *scheduler = create_test_scheduler();
     TEST_ASSERT(scheduler != NULL, "Failed to create scheduler");
 
-    group_scheduler_t *gs = create_test_group_scheduler(scheduler);
+    group_scheduler_t *gs = create_export_group_scheduler(scheduler);
     TEST_ASSERT(gs != NULL, "Failed to create group scheduler");
 
     configure_geometric_entries(gs);
@@ -565,7 +580,7 @@ void test_summary_export(void) {
         int first_active = phase - 1;
 
         if (phase > 1) {
-            group_scheduler_remove_entry(gs, (uint32_t)(phase - 2));
+            group_scheduler_remove_entry(gs, g_entry_ids[phase - 2]);
         }
 
         if (first_active >= NUM_ENTRIES) break;
@@ -581,7 +596,7 @@ void test_summary_export(void) {
 
     fprintf(stderr, "------+---------+---------------+----------+--------\n");
 
-    group_scheduler_destroy(scheduler, gs);
+    test_destroy_group_scheduler(scheduler, gs);
     hwfq_destroy(scheduler);
     TEST_PASS();
 }
