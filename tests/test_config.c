@@ -486,6 +486,143 @@ void test_allocation_failure(void)
     TEST_PASS();
 }
 
+// Test 14: Single flow per tenant (max_flows_per_tenant = 1)
+// Regression test: flow_id 0 is reserved internally, so with max_flows_per_tenant=1
+// the library must still allow adding one usable flow and enqueuing sessions on it.
+void test_single_flow_per_tenant(void)
+{
+    hwfq_scheduler_t *sched = NULL;
+    hwfq_config_t config = {
+        .max_tenants = 100,
+        .max_flows_per_tenant = 1,
+        .max_total_flows = 100,
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .total_capacity = 1000000000ULL,
+        .enable_statistics = false,
+        .alloc_fn = NULL,
+        .free_fn = NULL,
+        .session_available_fn = NULL,
+        .session_timeout_fn = NULL
+    };
+
+    int ret = hwfq_init(&config, &sched);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Init with max_flows_per_tenant=1 should succeed");
+
+    // Add tenant
+    hwfq_allocation_t tenant_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+    hwfq_tenant_id_t tenant_id;
+    ret = hwfq_add_tenant(sched, &tenant_alloc, &tenant_id);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Adding tenant should succeed");
+
+    // Add one flow - this is the critical test
+    hwfq_allocation_t flow_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+    hwfq_flow_id_t flow_id;
+    ret = hwfq_add_flow(sched, tenant_id, &flow_alloc, &flow_id);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Adding flow with max_flows_per_tenant=1 should succeed");
+    TEST_ASSERT(flow_id != 0, "Flow ID should not be 0 (reserved)");
+
+    // Enqueue a session
+    int user_data = 42;
+    hwfq_session_t session = {
+        .user_data = &user_data,
+        .work_size = 1000,
+        .timestamp = 0,
+        .timeout_ns = 0,
+        .cleanup_fn = NULL
+    };
+    ret = hwfq_enqueue(sched, tenant_id, flow_id, &session);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue should succeed");
+
+    // Dequeue and verify
+    hwfq_session_t out_session;
+    hwfq_tenant_id_t out_tenant;
+    hwfq_flow_id_t out_flow;
+    ret = hwfq_dequeue(sched, &out_session, &out_tenant, &out_flow);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Dequeue should succeed");
+    TEST_ASSERT(out_session.user_data == &user_data, "Dequeued session should match");
+    TEST_ASSERT(out_tenant == tenant_id, "Dequeued tenant should match");
+    TEST_ASSERT(out_flow == flow_id, "Dequeued flow should match");
+
+    // Adding a second flow should fail (max is 1)
+    hwfq_flow_id_t flow_id2;
+    ret = hwfq_add_flow(sched, tenant_id, &flow_alloc, &flow_id2);
+    TEST_ASSERT(ret != HWFQ_SUCCESS, "Adding second flow should fail with max_flows_per_tenant=1");
+
+    // Clean up
+    hwfq_remove_flow(sched, tenant_id, flow_id);
+    hwfq_remove_tenant(sched, tenant_id);
+    hwfq_destroy(sched);
+    TEST_PASS();
+}
+
+// Test 15: Multiple tenants each with single flow
+void test_multiple_tenants_single_flow(void)
+{
+    hwfq_scheduler_t *sched = NULL;
+    hwfq_config_t config = {
+        .max_tenants = 100,
+        .max_flows_per_tenant = 1,
+        .max_total_flows = 100,
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .total_capacity = 1000000000ULL,
+        .enable_statistics = false,
+        .alloc_fn = NULL,
+        .free_fn = NULL,
+        .session_available_fn = NULL,
+        .session_timeout_fn = NULL
+    };
+
+    int ret = hwfq_init(&config, &sched);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "Init should succeed");
+
+    hwfq_tenant_id_t tenant_ids[5];
+    hwfq_flow_id_t flow_ids[5];
+
+    // Add 5 tenants each with 1 flow
+    for (int i = 0; i < 5; i++) {
+        hwfq_allocation_t tenant_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+        ret = hwfq_add_tenant(sched, &tenant_alloc, &tenant_ids[i]);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Adding tenant should succeed");
+
+        hwfq_allocation_t flow_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+        ret = hwfq_add_flow(sched, tenant_ids[i], &flow_alloc, &flow_ids[i]);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Adding flow should succeed for each tenant");
+    }
+
+    // Enqueue one session per tenant
+    int user_data[5] = {10, 20, 30, 40, 50};
+    for (int i = 0; i < 5; i++) {
+        hwfq_session_t session = {
+            .user_data = &user_data[i],
+            .work_size = 1000,
+            .timestamp = 0,
+            .timeout_ns = 0,
+            .cleanup_fn = NULL
+        };
+        ret = hwfq_enqueue(sched, tenant_ids[i], flow_ids[i], &session);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Enqueue should succeed for each tenant");
+    }
+
+    // Dequeue all 5 sessions
+    for (int i = 0; i < 5; i++) {
+        hwfq_session_t out_session;
+        hwfq_tenant_id_t out_tenant;
+        hwfq_flow_id_t out_flow;
+        ret = hwfq_dequeue(sched, &out_session, &out_tenant, &out_flow);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "Should dequeue all sessions");
+    }
+
+    // Clean up
+    for (int i = 0; i < 5; i++) {
+        hwfq_remove_flow(sched, tenant_ids[i], flow_ids[i]);
+        hwfq_remove_tenant(sched, tenant_ids[i]);
+    }
+    hwfq_destroy(sched);
+    TEST_PASS();
+}
+
 // ============================================================================
 // Test Runner
 // ============================================================================
@@ -508,6 +645,8 @@ int main(void)
     test_multiple_tenants();
     test_invalid_parameters();
     test_allocation_failure();
+    test_single_flow_per_tenant();
+    test_multiple_tenants_single_flow();
 
     // Print summary
     printf("\n=== Test Summary ===\n");

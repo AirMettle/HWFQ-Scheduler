@@ -231,7 +231,7 @@ int hwfq_add_tenant(hwfq_scheduler_t *scheduler, const hwfq_allocation_t *alloca
         scheduler->config.num_groups,
         scheduler->config.bins_per_group,
         tenant_capacity,
-        scheduler->config.max_flows_per_tenant,
+        scheduler->config.max_flows_per_tenant + 1,  // +1 to account for reserved flow_id 0
         &tenant->flow_entries);  // Use per-tenant chunked entries
     if (tenant->flow_scheduler == NULL) {
         pthread_mutex_destroy(&tenant->lock);
