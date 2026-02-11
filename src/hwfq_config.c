@@ -206,7 +206,8 @@ int hwfq_add_tenant(hwfq_scheduler_t *scheduler, const hwfq_allocation_t *alloca
     tenant->has_backlog = false;
     tenant->tenant_session = NULL;
 
-    hwfq_chunked_entries_init(&tenant->flow_entries, scheduler->config.max_flows_per_tenant,
+    // Add 1 to max_flows_per_tenant to account for the reserved flow_id 0 slot
+    hwfq_chunked_entries_init(&tenant->flow_entries, scheduler->config.max_flows_per_tenant + 1,
                                scheduler->alloc_fn, scheduler->free_fn);
 
     // Pre-allocate flow_id 0 to reserve it (HWFQ_FLOW_ID_RESERVED = 0)
