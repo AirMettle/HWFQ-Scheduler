@@ -422,6 +422,12 @@ int hwfq_remove_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
         return HWFQ_ERR_NOT_FOUND;
     }
 
+    // Check if flow has pending work - must drain first
+    if (entry->stats.current_backlog > 0) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_TENANT_HAS_BACKLOG;
+    }
+
     group_scheduler_remove_entry(tenant->flow_scheduler, flow_id);
     hwfq_chunked_entries_free(&tenant->flow_entries, flow_id);
     pthread_mutex_unlock(&scheduler->lock);

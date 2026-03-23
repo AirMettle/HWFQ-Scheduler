@@ -267,13 +267,17 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler,
     context->timeout_ns = work->timeout_ns;
     context->cleanup_fn = work->cleanup_fn;
 
-    if (scheduler->config.enable_statistics) {
-        context->enqueue_time_ns = get_time_ns();
-        tenant->stats.current_backlog++;
+    // Always track backlog count (needed for flow removal guard)
+    tenant->stats.current_backlog++;
+    {
         entry_config_t *flow_entry = find_flow_entry(tenant, flow_id);
         if (flow_entry != NULL) {
             flow_entry->stats.current_backlog++;
         }
+    }
+
+    if (scheduler->config.enable_statistics) {
+        context->enqueue_time_ns = get_time_ns();
     }
 
     ret = group_scheduler_enqueue(
@@ -285,6 +289,11 @@ int hwfq_enqueue(hwfq_scheduler_t *scheduler,
         NULL);
 
     if (ret != HWFQ_SUCCESS) {
+        tenant->stats.current_backlog--;
+        entry_config_t *flow_entry = find_flow_entry(tenant, flow_id);
+        if (flow_entry != NULL) {
+            flow_entry->stats.current_backlog--;
+        }
         hwfq_free(scheduler, context);
         pthread_mutex_unlock(&scheduler->lock);
         return ret;
@@ -469,18 +478,22 @@ void hwfq_complete(hwfq_scheduler_t *scheduler,
         }
     }
 
+    // Always track backlog count (needed for flow removal guard)
+    if (tenant != NULL) {
+        if (tenant->stats.current_backlog > 0) {
+            tenant->stats.current_backlog--;
+        }
+        if (flow_entry != NULL && flow_entry->stats.current_backlog > 0) {
+            flow_entry->stats.current_backlog--;
+        }
+    }
+
     if (scheduler->config.enable_statistics && tenant != NULL) {
         tenant->stats.work_units_processed += found->work_size;
         tenant->stats.operations_completed++;
         if (flow_entry != NULL) {
             flow_entry->stats.work_units_processed += found->work_size;
             flow_entry->stats.operations_completed++;
-        }
-        if (tenant->stats.current_backlog > 0) {
-            tenant->stats.current_backlog--;
-        }
-        if (flow_entry != NULL && flow_entry->stats.current_backlog > 0) {
-            flow_entry->stats.current_backlog--;
         }
         update_tenant_rate_tracking(tenant, found->work_size, completion_time_ns);
         if (flow_entry != NULL) {
@@ -540,6 +553,27 @@ int hwfq_cancel(hwfq_scheduler_t *scheduler,
     in_flight_remove(scheduler, found);
     scheduler->in_flight_work_size -= found->work_size;
     scheduler->in_flight_count--;
+
+    // Always track backlog count (needed for flow removal guard)
+    {
+        tenant_config_t *tenant = NULL;
+        entry_config_t *flow_entry = NULL;
+        if (found->tenant_id < scheduler->config.max_tenants) {
+            tenant = scheduler->tenants[found->tenant_id];
+            if (tenant != NULL && tenant->configured) {
+                flow_entry = find_flow_entry(tenant, found->flow_id);
+            }
+        }
+        if (tenant != NULL) {
+            if (tenant->stats.current_backlog > 0) {
+                tenant->stats.current_backlog--;
+            }
+            if (flow_entry != NULL && flow_entry->stats.current_backlog > 0) {
+                flow_entry->stats.current_backlog--;
+            }
+        }
+    }
+
     bool has_capacity = scheduler->in_flight_work_size < scheduler->config.total_capacity;
     bool has_work = !group_scheduler_is_empty(scheduler->system_scheduler);
 
