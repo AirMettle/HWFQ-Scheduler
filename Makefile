@@ -50,7 +50,8 @@ TEST_FILES = $(TEST_DIR)/test_config.c \
              $(TEST_DIR)/test_group_scheduler_concurrency.c \
              $(TEST_DIR)/test_flow_trie.c \
              $(TEST_DIR)/test_chunked_entries.c \
-             $(TEST_DIR)/test_calendar.c
+             $(TEST_DIR)/test_calendar.c \
+             $(TEST_DIR)/test_hierarchical_fairness_at_scale.c
 TEST_BINS = $(patsubst $(TEST_DIR)/%.c,$(BIN_DIR)/%,$(TEST_FILES))
 
 # Example files
@@ -67,14 +68,14 @@ CFLAGS_RELEASE = $(CFLAGS_COMMON) -O3 -DNDEBUG
 # Linker flags
 LDFLAGS = -L$(LIB_DIR) -lhwfq -lpthread -lm
 
-# Default to debug build
-CFLAGS = $(CFLAGS_DEBUG)
+# Default to release build
+CFLAGS = $(CFLAGS_RELEASE)
 
 # Build mode (debug or release)
-MODE ?= debug
+MODE ?= release
 
-ifeq ($(MODE),release)
-    CFLAGS = $(CFLAGS_RELEASE)
+ifeq ($(MODE),debug)
+    CFLAGS = $(CFLAGS_DEBUG)
 endif
 
 # ============================================================================

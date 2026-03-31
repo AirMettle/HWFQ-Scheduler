@@ -353,7 +353,11 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
     tenant->has_backlog = false;
     tenant->tenant_session = NULL;
 
+    // Advance system-level virtual time by the tenant session's work size.
+    // Without this, WF2Q+ degrades to round-robin across tenants.
+    uint64_t tenant_work = session_get_work_size(tenant_session);
     hwfq_free(scheduler, tenant_session);
+    group_scheduler_update_virtual_time(scheduler->system_scheduler, tenant_work);
 
     session_state_t *flow_session = group_scheduler_dequeue(tenant->flow_scheduler);
     if (flow_session == NULL) {

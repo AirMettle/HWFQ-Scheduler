@@ -70,6 +70,9 @@ int hwfq_init(const hwfq_config_t *config, hwfq_scheduler_t **scheduler_out)
     if (config->max_tenants == 0 || config->max_flows_per_tenant == 0) {
         return HWFQ_ERR_INVALID_ARG;
     }
+    if (config->total_capacity == 0) {
+        return HWFQ_ERR_INVALID_ARG;
+    }
     void *(*alloc_fn)(size_t) = (config->alloc_fn != NULL) ? config->alloc_fn : malloc;
     hwfq_scheduler_t *scheduler = (hwfq_scheduler_t *)alloc_fn(sizeof(hwfq_scheduler_t));
     if (scheduler == NULL) {

@@ -802,25 +802,36 @@ static void test_session_available_callback(void)
     TEST_PASS();
 }
 
-// Test 14: Zero total_capacity means unlimited
+// Test 14: Zero total_capacity is rejected; use large capacity for "unlimited" behavior
 static void test_zero_capacity_unlimited(void)
 {
-    // Create scheduler with zero capacity (should mean unlimited)
+    // Zero capacity should be rejected (breaks WF2Q+ virtual time advancement)
+    hwfq_config_t bad_config = {
+        .max_tenants = 100,
+        .max_flows_per_tenant = 1000,
+        .max_total_flows = 10000,
+        .total_capacity = 0,
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .enable_statistics = false,
+    };
+
+    hwfq_scheduler_t *scheduler = NULL;
+    int ret = hwfq_init(&bad_config, &scheduler);
+    TEST_ASSERT(ret == HWFQ_ERR_INVALID_ARG, "Zero total_capacity should be rejected");
+
+    // Use a very large capacity for effectively unlimited behavior
     hwfq_config_t config = {
         .max_tenants = 100,
         .max_flows_per_tenant = 1000,
         .max_total_flows = 10000,
-        .total_capacity = 0,  // Zero = unlimited
+        .total_capacity = UINT64_MAX / 2,  // Effectively unlimited
         .num_groups = 16,
         .bins_per_group = 2048,
         .enable_statistics = false,
-        .alloc_fn = NULL,
-        .free_fn = NULL,
-        .session_available_fn = NULL
     };
 
-    hwfq_scheduler_t *scheduler = NULL;
-    int ret = hwfq_init(&config, &scheduler);
+    ret = hwfq_init(&config, &scheduler);
     TEST_ASSERT(ret == HWFQ_SUCCESS && scheduler != NULL, "Failed to create scheduler");
 
     // Add tenant
@@ -836,7 +847,7 @@ static void test_zero_capacity_unlimited(void)
     hwfq_flow_id_t flow_id = add_default_flow(scheduler, tenant_id);
     TEST_ASSERT(flow_id != 0, "Failed to add flow");
 
-    // Enqueue many work items
+    // Enqueue many work items with large work size
     hwfq_session_t work = {
         .user_data = NULL,
         .work_size = 1000000,  // Large work size
@@ -855,7 +866,7 @@ static void test_zero_capacity_unlimited(void)
         dequeue_count++;
     }
 
-    TEST_ASSERT(dequeue_count == 100, "Should dequeue all 100 with unlimited capacity");
+    TEST_ASSERT(dequeue_count == 100, "Should dequeue all 100 with large capacity");
 
     test_hwfq_destroy(scheduler);
     TEST_PASS();

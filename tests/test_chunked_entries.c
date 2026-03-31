@@ -42,12 +42,14 @@ static void test_chunked_alloc_free(void) {
 
     uint32_t entry_id;
     int ret = hwfq_chunked_entries_alloc(&ce, &entry_id);
+    (void)ret;
     assert(ret == 0);
     assert(entry_id != HWFQ_ENTRY_NONE);
 
     assert(hwfq_chunked_entries_count(&ce) == 1);
 
     entry_config_t *entry = hwfq_chunked_get(&ce, entry_id);
+    (void)entry;
     assert(entry != NULL);
 
     hwfq_chunked_entries_free(&ce, entry_id);
@@ -70,6 +72,7 @@ static void test_chunked_alloc_many(void) {
     uint32_t entry_ids[2500];
     for (int i = 0; i < 2500; i++) {
         int ret = hwfq_chunked_entries_alloc(&ce, &entry_ids[i]);
+        (void)ret;
         assert(ret == 0);
         assert(entry_ids[i] != HWFQ_ENTRY_NONE);
     }
@@ -78,6 +81,7 @@ static void test_chunked_alloc_many(void) {
 
     for (int i = 0; i < 2500; i++) {
         entry_config_t *entry = hwfq_chunked_get(&ce, entry_ids[i]);
+        (void)entry;
         assert(entry != NULL);
     }
 
@@ -99,6 +103,7 @@ static void test_chunked_free_reuse(void) {
     uint32_t entry_ids[10];
     for (int i = 0; i < 10; i++) {
         int ret = hwfq_chunked_entries_alloc(&ce, &entry_ids[i]);
+        (void)ret;
         assert(ret == 0);
     }
 
@@ -109,6 +114,7 @@ static void test_chunked_free_reuse(void) {
     uint32_t new_ids[5];
     for (int i = 0; i < 5; i++) {
         int ret = hwfq_chunked_entries_alloc(&ce, &new_ids[i]);
+        (void)ret;
         assert(ret == 0);
     }
 
@@ -131,15 +137,19 @@ static void test_chunked_entry_lookup(void) {
 
     uint32_t entry_id;
     int ret = hwfq_chunked_entries_alloc(&ce, &entry_id);
+    (void)ret;
     assert(ret == 0);
 
     entry_config_t *entry = hwfq_chunked_get(&ce, entry_id);
+    (void)entry;
     assert(entry != NULL);
 
     entry_config_t *invalid = hwfq_chunked_get(&ce, HWFQ_ENTRY_NONE);
+    (void)invalid;
     assert(invalid == NULL);
 
     entry_config_t *out_of_range = hwfq_chunked_get(&ce, 9999);
+    (void)out_of_range;
     assert(out_of_range == NULL);
 
     hwfq_chunked_entries_destroy(&ce);
@@ -162,6 +172,7 @@ static void test_chunked_count(void) {
     uint32_t entry_ids[50];
     for (int i = 0; i < 50; i++) {
         int ret = hwfq_chunked_entries_alloc(&ce, &entry_ids[i]);
+        (void)ret;
         assert(ret == 0);
         assert(hwfq_chunked_entries_count(&ce) == (uint32_t)(i + 1));
     }
@@ -190,6 +201,7 @@ static void test_chunked_max_capacity(void) {
     uint32_t entry_id;
     for (int i = 0; i < 50; i++) {
         int ret = hwfq_chunked_entries_alloc(&ce, &entry_id);
+        (void)ret;
         assert(ret == 0);
     }
 
@@ -197,6 +209,7 @@ static void test_chunked_max_capacity(void) {
     assert(!hwfq_chunked_entries_has_capacity(&ce));
 
     int ret = hwfq_chunked_entries_alloc(&ce, &entry_id);
+    (void)ret;
     assert(ret != 0);
 
     hwfq_chunked_entries_destroy(&ce);

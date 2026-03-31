@@ -82,6 +82,7 @@ static void test_calendar_insert_single(void) {
     assert(session != NULL);
 
     int ret = calendar_insert_session(gs, session);
+    (void)ret;
     assert(ret == HWFQ_SUCCESS);
 
     assert(gs->min_finish_time == 1000);
@@ -139,6 +140,7 @@ static void test_calendar_remove(void) {
     gs->active_session_count = 1;
 
     int ret = calendar_remove_session(gs, session);
+    (void)ret;
     assert(ret == HWFQ_SUCCESS);
 
     assert(gs->min_session == NULL);
@@ -174,6 +176,7 @@ static void test_calendar_find_min(void) {
 
     gs->virtual_time = 0;
     session_state_t *min = calendar_find_min_session(gs);
+    (void)min;
     assert(min == session2);
 
     // Note: sessions in bins are freed by group_scheduler_destroy
@@ -223,6 +226,7 @@ static void test_calendar_group_index(void) {
     uint64_t base_interval = 1000;
 
     uint32_t g = calculate_group_index_from_interval(500, base_interval);
+    (void)g;
     assert(g == 0);
 
     g = calculate_group_index_from_interval(1000, base_interval);
@@ -257,6 +261,7 @@ static void test_calendar_bin_calculation(void) {
     uint32_t bins_per_group = 64;
 
     uint32_t bin = calculate_bin_index_from_finish_time(0, 0, bins_per_group, base_interval);
+    (void)bin;
     assert(bin < bins_per_group);
 
     bin = calculate_bin_index_from_finish_time(1000, 0, bins_per_group, base_interval);
@@ -267,6 +272,8 @@ static void test_calendar_bin_calculation(void) {
 
     uint32_t bin1 = calculate_bin_index_from_finish_time(1000, 1, bins_per_group, base_interval);
     uint32_t bin2 = calculate_bin_index_from_finish_time(2000, 1, bins_per_group, base_interval);
+    (void)bin1;
+    (void)bin2;
     assert(bin1 < bins_per_group);
     assert(bin2 < bins_per_group);
 
@@ -316,6 +323,7 @@ static void test_calendar_eligibility(void) {
 
     gs->virtual_time = 500;
     session_state_t *min = calendar_find_min_session(gs);
+    (void)min;
     assert(min == eligible_session);
 
     // Note: sessions in bins are freed by group_scheduler_destroy

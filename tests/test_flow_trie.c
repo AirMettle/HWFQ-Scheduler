@@ -20,6 +20,7 @@ static void test_trie_init_destroy(void) {
     hwfq_flow_trie_t trie;
 
     int ret = hwfq_flow_trie_init(&trie, 1000, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     assert(hwfq_flow_trie_capacity(&trie) == 1000);
@@ -40,6 +41,7 @@ static void test_trie_alloc_sequential(void) {
 
     hwfq_flow_trie_t trie;
     int ret = hwfq_flow_trie_init(&trie, 1000, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     uint32_t flow_ids[100];
@@ -69,6 +71,7 @@ static void test_trie_alloc_free_cycle(void) {
 
     hwfq_flow_trie_t trie;
     int ret = hwfq_flow_trie_init(&trie, 1000, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     uint32_t flow_id1, flow_id2;
@@ -84,6 +87,7 @@ static void test_trie_alloc_free_cycle(void) {
     assert(ret == 0);
 
     uint32_t alloc_count = hwfq_flow_trie_allocated_count(&trie);
+    (void)alloc_count;
     assert(alloc_count == 2);
 
     hwfq_flow_trie_destroy(&trie, NULL);
@@ -101,6 +105,7 @@ static void test_trie_exhaustion(void) {
     hwfq_flow_trie_t trie;
     uint32_t max_flows = 100;
     int ret = hwfq_flow_trie_init(&trie, max_flows, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     uint32_t flow_id;
@@ -129,6 +134,7 @@ static void test_trie_reserved_id_zero(void) {
 
     hwfq_flow_trie_t trie;
     int ret = hwfq_flow_trie_init(&trie, 1000, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     assert(hwfq_flow_trie_is_allocated(&trie, 0));
@@ -157,6 +163,7 @@ static void test_trie_count_accuracy(void) {
 
     hwfq_flow_trie_t trie;
     int ret = hwfq_flow_trie_init(&trie, 500, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     assert(hwfq_flow_trie_allocated_count(&trie) == 1);
@@ -192,6 +199,7 @@ static void test_trie_is_allocated(void) {
 
     hwfq_flow_trie_t trie;
     int ret = hwfq_flow_trie_init(&trie, 1000, NULL, NULL);
+    (void)ret;
     assert(ret == 0);
 
     assert(!hwfq_flow_trie_is_allocated(&trie, 1));
