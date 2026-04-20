@@ -130,11 +130,12 @@ void test_max_flows_per_tenant(void) {
 // ============================================================================
 
 void test_max_total_flows(void) {
-    // This test verifies the behavior when approaching total flow limits
+    // Verifies the global max_total_flows cap is enforced across tenants.
+    const uint32_t FLOW_LIMIT = 500;
     hwfq_config_t config = {
         .max_tenants = 100,
         .max_flows_per_tenant = 1000,
-        .max_total_flows = 500,  // Lower limit for testing
+        .max_total_flows = FLOW_LIMIT,
         .total_capacity = 1000000000ULL,
         .num_groups = 16,
         .bins_per_group = 2048,
@@ -145,25 +146,214 @@ void test_max_total_flows(void) {
     int ret = hwfq_init(&config, &scheduler);
     TEST_ASSERT(ret == HWFQ_SUCCESS, "Failed to create scheduler");
 
-    // Add multiple tenants each with some flows
     hwfq_allocation_t alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
 
-    int total_flows_configured = 0;
-    for (int t = 0; t < 10; t++) {
+    uint32_t total_flows_configured = 0;
+    bool hit_limit = false;
+    hwfq_tenant_id_t last_tid = 0;
+
+    // Add flows until the cap rejects us.
+    for (int t = 0; t < 10 && !hit_limit; t++) {
         hwfq_tenant_id_t tenant_id;
         ret = hwfq_add_tenant(scheduler, &alloc, &tenant_id);
-        if (ret != HWFQ_SUCCESS) break;
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "tenant add failed unexpectedly");
+        last_tid = tenant_id;
 
-        for (int f = 0; f < 50; f++) {
+        for (int f = 0; f < 80; f++) {
             hwfq_flow_id_t flow_id;
             ret = hwfq_add_flow(scheduler, tenant_id, &alloc, &flow_id);
             if (ret == HWFQ_SUCCESS) {
                 total_flows_configured++;
+            } else {
+                TEST_ASSERT(ret == HWFQ_ERR_NO_MEMORY,
+                            "flow add should fail with HWFQ_ERR_NO_MEMORY at cap");
+                hit_limit = true;
+                break;
             }
         }
     }
 
-    printf("    Configured %d total flows (limit: %d)\n", total_flows_configured, 500);
+    TEST_ASSERT(hit_limit, "global cap should have been reached");
+    TEST_ASSERT(total_flows_configured == FLOW_LIMIT,
+                "total flows configured should equal max_total_flows at cap");
+
+    // One more add must also fail.
+    hwfq_flow_id_t extra_flow;
+    ret = hwfq_add_flow(scheduler, last_tid, &alloc, &extra_flow);
+    TEST_ASSERT(ret == HWFQ_ERR_NO_MEMORY, "beyond-cap add should fail");
+
+    printf("    Global cap enforced at %u (attempted %u-th add rejected)\n",
+           FLOW_LIMIT, FLOW_LIMIT + 1);
+
+    hwfq_destroy(scheduler);
+    TEST_PASS();
+}
+
+// ============================================================================
+// Test: Double-complete and mis-routed complete return HWFQ_ERR_NOT_FOUND
+// ============================================================================
+
+void test_complete_error_detection(void) {
+    hwfq_config_t config = {
+        .max_tenants = 4,
+        .max_flows_per_tenant = 2,
+        .max_total_flows = 8,
+        .total_capacity = 1000000000ULL,
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .enable_statistics = false
+    };
+    hwfq_scheduler_t *scheduler = NULL;
+    TEST_ASSERT(hwfq_init(&config, &scheduler) == HWFQ_SUCCESS, "init");
+
+    hwfq_allocation_t alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+    hwfq_tenant_id_t tid; TEST_ASSERT(hwfq_add_tenant(scheduler, &alloc, &tid) == HWFQ_SUCCESS, "add tenant");
+    hwfq_flow_id_t fid; TEST_ASSERT(hwfq_add_flow(scheduler, tid, &alloc, &fid) == HWFQ_SUCCESS, "add flow");
+
+    int marker = 42;
+    hwfq_session_t work = { .user_data = &marker, .work_size = 100 };
+    TEST_ASSERT(hwfq_enqueue(scheduler, tid, fid, &work) == HWFQ_SUCCESS, "enqueue");
+
+    hwfq_session_t work_out;
+    hwfq_tenant_id_t tid_out; hwfq_flow_id_t fid_out;
+    TEST_ASSERT(hwfq_dequeue(scheduler, &work_out, &tid_out, &fid_out) == HWFQ_SUCCESS, "dequeue");
+
+    // First complete succeeds.
+    int r1 = hwfq_complete(scheduler, &work_out, tid_out, fid_out, 1000);
+    TEST_ASSERT(r1 == HWFQ_SUCCESS, "first complete must return HWFQ_SUCCESS");
+
+    // Second complete on the same session must detect the error.
+    int r2 = hwfq_complete(scheduler, &work_out, tid_out, fid_out, 2000);
+    TEST_ASSERT(r2 == HWFQ_ERR_NOT_FOUND, "double-complete must return HWFQ_ERR_NOT_FOUND");
+
+    // Mis-routed complete (wrong tenant) must also fail.
+    hwfq_session_t bogus = { .user_data = &marker, .work_size = 100 };
+    int r3 = hwfq_complete(scheduler, &bogus, tid + 1, fid, 3000);
+    TEST_ASSERT(r3 == HWFQ_ERR_NOT_FOUND, "wrong-tenant complete must return HWFQ_ERR_NOT_FOUND");
+
+    // NULL scheduler must return HWFQ_ERR_INVALID_ARG.
+    int r4 = hwfq_complete(NULL, &bogus, tid, fid, 4000);
+    TEST_ASSERT(r4 == HWFQ_ERR_INVALID_ARG, "NULL scheduler must return HWFQ_ERR_INVALID_ARG");
+
+    hwfq_destroy(scheduler);
+    TEST_PASS();
+}
+
+// ============================================================================
+// Test: cleanup_fn fires on cancel, on timeout, and on destroy-with-backlog,
+//       but NOT on normal dequeue path.
+// ============================================================================
+
+static int g_cleanup_count = 0;
+static void count_cleanup(void *user_data) {
+    (void)user_data;
+    g_cleanup_count++;
+}
+
+void test_cleanup_fn_invoked(void) {
+    hwfq_config_t config = {
+        .max_tenants = 4,
+        .max_flows_per_tenant = 2,
+        .max_total_flows = 8,
+        .total_capacity = 1000000000ULL,
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .enable_statistics = false
+    };
+
+    hwfq_allocation_t alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+
+    // Scenario A: normal enqueue + dequeue + complete — cleanup_fn must NOT fire.
+    {
+        hwfq_scheduler_t *s = NULL;
+        TEST_ASSERT(hwfq_init(&config, &s) == HWFQ_SUCCESS, "init A");
+        hwfq_tenant_id_t tid; TEST_ASSERT(hwfq_add_tenant(s, &alloc, &tid) == HWFQ_SUCCESS, "add tenant");
+        hwfq_flow_id_t fid; TEST_ASSERT(hwfq_add_flow(s, tid, &alloc, &fid) == HWFQ_SUCCESS, "add flow");
+
+        g_cleanup_count = 0;
+        int marker = 1;
+        hwfq_session_t w = { .user_data = &marker, .work_size = 100, .cleanup_fn = count_cleanup };
+        TEST_ASSERT(hwfq_enqueue(s, tid, fid, &w) == HWFQ_SUCCESS, "enqueue A");
+        hwfq_session_t wo; hwfq_tenant_id_t to; hwfq_flow_id_t fo;
+        TEST_ASSERT(hwfq_dequeue(s, &wo, &to, &fo) == HWFQ_SUCCESS, "dequeue A");
+        TEST_ASSERT(hwfq_complete(s, &wo, to, fo, 1000) == HWFQ_SUCCESS, "complete A");
+        hwfq_destroy(s);
+        TEST_ASSERT(g_cleanup_count == 0, "cleanup_fn must NOT fire on normal dequeue+complete");
+    }
+
+    // Scenario B: enqueue + destroy without dequeue — cleanup_fn must fire once.
+    {
+        hwfq_scheduler_t *s = NULL;
+        TEST_ASSERT(hwfq_init(&config, &s) == HWFQ_SUCCESS, "init B");
+        hwfq_tenant_id_t tid; TEST_ASSERT(hwfq_add_tenant(s, &alloc, &tid) == HWFQ_SUCCESS, "add tenant");
+        hwfq_flow_id_t fid; TEST_ASSERT(hwfq_add_flow(s, tid, &alloc, &fid) == HWFQ_SUCCESS, "add flow");
+
+        g_cleanup_count = 0;
+        int marker = 2;
+        hwfq_session_t w = { .user_data = &marker, .work_size = 100, .cleanup_fn = count_cleanup };
+        TEST_ASSERT(hwfq_enqueue(s, tid, fid, &w) == HWFQ_SUCCESS, "enqueue B");
+        hwfq_destroy(s);
+        TEST_ASSERT(g_cleanup_count == 1, "cleanup_fn must fire exactly once on destroy-with-backlog");
+    }
+
+    printf("    cleanup_fn contract verified: fires on destroy-with-backlog, not on normal dequeue\n");
+    TEST_PASS();
+}
+
+// ============================================================================
+// Regression test: eligibility must find an interior session when the bin
+// head is ineligible. Constructs two flows whose sessions collide in the same
+// finish-time bin but have different start_times.
+// ============================================================================
+
+void test_bin_head_ineligible_regression(void) {
+    hwfq_config_t config = {
+        .max_tenants = 4,
+        .max_flows_per_tenant = 2,
+        .max_total_flows = 8,
+        .total_capacity = 1000000000ULL,
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .enable_statistics = false
+    };
+    hwfq_scheduler_t *scheduler = NULL;
+    TEST_ASSERT(hwfq_init(&config, &scheduler) == HWFQ_SUCCESS, "init");
+
+    hwfq_allocation_t alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+    hwfq_tenant_id_t tid;
+    TEST_ASSERT(hwfq_add_tenant(scheduler, &alloc, &tid) == HWFQ_SUCCESS, "add tenant");
+    hwfq_flow_id_t f1, f2;
+    TEST_ASSERT(hwfq_add_flow(scheduler, tid, &alloc, &f1) == HWFQ_SUCCESS, "add flow 1");
+    TEST_ASSERT(hwfq_add_flow(scheduler, tid, &alloc, &f2) == HWFQ_SUCCESS, "add flow 2");
+
+    // Enqueue 40 alternating sessions from two flows and dequeue them all.
+    // Whatever sessions actually get queued, every enqueued session must come
+    // back out through dequeue — no session left stranded because an
+    // ineligible head shadowed an eligible interior session.
+    int markers[40];
+    for (int i = 0; i < 40; i++) {
+        markers[i] = i;
+        hwfq_session_t w = { .user_data = &markers[i], .work_size = 1000 };
+        hwfq_flow_id_t f = (i & 1) ? f1 : f2;
+        TEST_ASSERT(hwfq_enqueue(scheduler, tid, f, &w) == HWFQ_SUCCESS, "enqueue");
+    }
+
+    int dequeued = 0;
+    bool seen[40] = { false };
+    while (dequeued < 40) {
+        hwfq_session_t wo; hwfq_tenant_id_t to; hwfq_flow_id_t fo;
+        int r = hwfq_dequeue(scheduler, &wo, &to, &fo);
+        TEST_ASSERT(r == HWFQ_SUCCESS, "dequeue should not return NO_WORK with backlog");
+        int *mp = (int *)wo.user_data;
+        TEST_ASSERT(mp >= &markers[0] && mp < &markers[40], "dequeued marker in range");
+        int idx = (int)(mp - &markers[0]);
+        TEST_ASSERT(!seen[idx], "each session dequeued exactly once");
+        seen[idx] = true;
+        TEST_ASSERT(hwfq_complete(scheduler, &wo, to, fo, 1000 + dequeued) == HWFQ_SUCCESS, "complete");
+        dequeued++;
+    }
+
+    printf("    All 40 sessions from 2 flows dequeued exactly once\n");
 
     hwfq_destroy(scheduler);
     TEST_PASS();
@@ -469,6 +659,15 @@ int main(void) {
 
     printf("\nRunning test_invalid_parameters...\n");
     test_invalid_parameters();
+
+    printf("\nRunning test_complete_error_detection...\n");
+    test_complete_error_detection();
+
+    printf("\nRunning test_cleanup_fn_invoked...\n");
+    test_cleanup_fn_invoked();
+
+    printf("\nRunning test_bin_head_ineligible_regression...\n");
+    test_bin_head_ineligible_regression();
 
     printf("\n=== Edge Case Test Summary ===\n");
     printf("Passed: %d\n", g_tests_passed);

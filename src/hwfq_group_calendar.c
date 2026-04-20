@@ -174,12 +174,6 @@ static inline bool bin_list_is_empty(group_scheduler_t *gs, uint32_t bin_index)
     return gs->bin_heads[bin_index] == NULL;
 }
 
-// Peek at minimum session in bin (list head) - O(1)
-static inline session_state_t *bin_list_peek(group_scheduler_t *gs, uint32_t bin_index)
-{
-    return gs->bin_heads[bin_index];
-}
-
 // ============================================================================
 // DTS-Calendar Queue Operations (Dual-Time Scheduler)
 // ============================================================================
@@ -264,16 +258,20 @@ static session_state_t *find_eligible_min_bitfield(group_scheduler_t *gs,
 
                 if (bin_idx >= bin_end) break;
 
-                // Check this bin's list head - O(1) peek
-                session_state_t *head = bin_list_peek(gs, bin_idx);
-
-                // Only check list head - if head is eligible and has min finish_time, use it
-                // If head is not eligible, skip this bin (virtual time will be advanced)
-                if (head != NULL && head->start_time <= virtual_time) {
-                    if (head->finish_time < min_eligible_finish) {
-                        min_eligible_finish = head->finish_time;
-                        eligible_min = head;
-                    }
+                // Scan the bin list. The list is sorted by finish_time ascending,
+                // so the first session whose start_time <= virtual_time is also the
+                // eligible session with the minimum finish_time in this bin.
+                // Walking past ineligible heads is required for correctness: sessions
+                // from different flows sharing a bin can have different start_times,
+                // so an ineligible head may hide an eligible interior session whose
+                // finish_time is the minimum across the whole scheduler.
+                session_state_t *cand = gs->bin_heads[bin_idx];
+                while (cand != NULL && cand->start_time > virtual_time) {
+                    cand = cand->bin_next;
+                }
+                if (cand != NULL && cand->finish_time < min_eligible_finish) {
+                    min_eligible_finish = cand->finish_time;
+                    eligible_min = cand;
                 }
 
                 // Clear this bit and continue
@@ -303,14 +301,19 @@ session_state_t *calendar_find_min_session(group_scheduler_t *gs)
     // Use bitfield-guided search for eligible session - O(B) complexity
     session_state_t *eligible_min = find_eligible_min_bitfield(gs, virtual_time);
 
-    // If no eligible sessions found, advance virtual time and try again
-    // Use cached min_start_time (maintained incrementally on insert/remove)
+    // If no eligible sessions found, advance virtual time and try again.
+    // Use cached min_start_time (maintained incrementally on insert/remove).
+    // Guard against decreasing virtual_time: the WF2Q+ update rule is
+    //   V(t+Δt) = max(V(t)+Δt, min{S_i}), so the jump-ahead must never
+    //   move virtual time backwards, even if min_start_time is stale or
+    //   has been rebased below current virtual_time.
     if (eligible_min == NULL && gs->min_start_time != UINT64_MAX) {
-        // Advance virtual time to make at least one session eligible
-        gs->virtual_time = gs->min_start_time;
-        virtual_time = gs->min_start_time;
+        if (gs->min_start_time > gs->virtual_time) {
+            gs->virtual_time = gs->min_start_time;
+            virtual_time = gs->min_start_time;
+        }
 
-        // Re-search with updated virtual time - now at least one session is eligible
+        // Re-search with updated virtual time
         eligible_min = find_eligible_min_bitfield(gs, virtual_time);
     }
 

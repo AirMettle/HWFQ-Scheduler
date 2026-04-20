@@ -882,7 +882,7 @@ static void test_timeout_callback(hwfq_scheduler_t *scheduler,
                                   hwfq_tenant_id_t tenant_id,
                                   hwfq_flow_id_t flow_id,
                                   void *user_data,
-                                  size_t work_size,
+                                  uint64_t work_size,
                                   uint64_t timeout_ns)
 {
     (void)scheduler;

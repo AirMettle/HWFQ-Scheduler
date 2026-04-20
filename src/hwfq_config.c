@@ -47,6 +47,18 @@ static void remove_tenant(hwfq_scheduler_t *scheduler, tenant_config_t *tenant)
         return;
     }
 
+    // Tenant owns 1 reserved entry + N user-added flows in its chunked pool.
+    // Decrement the global active-flow count by the user flows only.
+    uint32_t configured = hwfq_chunked_entries_count(&tenant->flow_entries);
+    if (configured > 0) {
+        uint32_t user_flows = configured - 1;  // subtract reserved flow_id 0
+        if (scheduler->total_active_flows >= user_flows) {
+            scheduler->total_active_flows -= user_flows;
+        } else {
+            scheduler->total_active_flows = 0;
+        }
+    }
+
     if (tenant->flow_scheduler != NULL) {
         group_scheduler_destroy(scheduler, tenant->flow_scheduler);
         tenant->flow_scheduler = NULL;
@@ -378,6 +390,12 @@ int hwfq_add_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
         return HWFQ_ERR_NOT_FOUND;
     }
 
+    if (scheduler->config.max_total_flows > 0 &&
+        scheduler->total_active_flows >= scheduler->config.max_total_flows) {
+        pthread_mutex_unlock(&scheduler->lock);
+        return HWFQ_ERR_NO_MEMORY;
+    }
+
     uint32_t flow_id;
     int alloc_ret = hwfq_chunked_entries_alloc(&tenant->flow_entries, &flow_id);
     if (alloc_ret != HWFQ_SUCCESS) {
@@ -396,6 +414,7 @@ int hwfq_add_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
         return ret;
     }
 
+    scheduler->total_active_flows++;
     *flow_id_out = flow_id;
     pthread_mutex_unlock(&scheduler->lock);
     return HWFQ_SUCCESS;
@@ -433,6 +452,9 @@ int hwfq_remove_flow(hwfq_scheduler_t *scheduler, hwfq_tenant_id_t tenant_id,
 
     group_scheduler_remove_entry(tenant->flow_scheduler, flow_id);
     hwfq_chunked_entries_free(&tenant->flow_entries, flow_id);
+    if (scheduler->total_active_flows > 0) {
+        scheduler->total_active_flows--;
+    }
     pthread_mutex_unlock(&scheduler->lock);
     return HWFQ_SUCCESS;
 }
@@ -488,7 +510,7 @@ int hwfq_get_capacity_info(hwfq_scheduler_t *scheduler, hwfq_capacity_info_t *ca
     capacity_info_out->available_capacity =
         scheduler->config.total_capacity - scheduler->allocated_rate_capacity;
     capacity_info_out->num_configured_tenants = scheduler->num_configured_tenants;
-    capacity_info_out->num_active_flows = 0;
+    capacity_info_out->num_active_flows = scheduler->total_active_flows;
     if (scheduler->config.total_capacity > 0) {
         capacity_info_out->utilization_percent = (double)scheduler->allocated_rate_capacity /
                                                  (double)scheduler->config.total_capacity * 100.0;

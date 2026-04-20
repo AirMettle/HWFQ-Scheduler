@@ -22,6 +22,11 @@ target_include_directories(hwfq
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+target_compile_options(hwfq PRIVATE
+    -Wall -Wextra -Wpedantic -Wshadow
+    -fstack-protector-strong
+)
+
 target_link_libraries(hwfq PUBLIC pthread m)
 
 install(TARGETS hwfq

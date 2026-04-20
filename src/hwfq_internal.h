@@ -74,6 +74,7 @@ struct hwfq_scheduler_t {
     void (*free_fn)(void *);
     tenant_config_t **tenants;
     uint32_t num_configured_tenants;
+    uint32_t total_active_flows;
     uint64_t allocated_rate_capacity;
     hwfq_chunked_entries_t tenant_entries;
     group_scheduler_t *system_scheduler;

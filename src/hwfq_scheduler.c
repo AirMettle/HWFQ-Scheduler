@@ -382,6 +382,13 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
         return HWFQ_ERR_NO_WORK;
     }
 
+    // Advance tenant-level virtual time by the flow session's work size.
+    // Mirrors the system-level advancement above so that WF2Q+ eligibility
+    // is enforced at BOTH levels of the hierarchy. Without this, the tenant
+    // scheduler degrades to WFQ — long-run weighted fairness still holds,
+    // but WF2Q+'s bounded-delay guarantee within a tenant does not.
+    group_scheduler_update_virtual_time(tenant->flow_scheduler, context->work_size);
+
     work_out->user_data = context->user_data;
     work_out->work_size = context->work_size;
     work_out->timestamp = context->enqueue_time_ns;  // Return enqueue time if tracked
@@ -435,14 +442,14 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler,
     return HWFQ_SUCCESS;
 }
 
-void hwfq_complete(hwfq_scheduler_t *scheduler,
-                   const hwfq_session_t *work,
-                   hwfq_tenant_id_t tenant_id,
-                   hwfq_flow_id_t flow_id,
-                   uint64_t completion_time_ns)
+int hwfq_complete(hwfq_scheduler_t *scheduler,
+                  const hwfq_session_t *work,
+                  hwfq_tenant_id_t tenant_id,
+                  hwfq_flow_id_t flow_id,
+                  uint64_t completion_time_ns)
 {
     if (scheduler == NULL) {
-        return;
+        return HWFQ_ERR_INVALID_ARG;
     }
 
     pthread_mutex_lock(&scheduler->lock);
@@ -465,7 +472,7 @@ void hwfq_complete(hwfq_scheduler_t *scheduler,
 
     if (found == NULL) {
         pthread_mutex_unlock(&scheduler->lock);
-        return;
+        return HWFQ_ERR_NOT_FOUND;
     }
 
     in_flight_remove(scheduler, found);
@@ -520,6 +527,7 @@ void hwfq_complete(hwfq_scheduler_t *scheduler,
     if (has_capacity && has_work && scheduler->config.session_available_fn != NULL) {
         scheduler->config.session_available_fn(scheduler);
     }
+    return HWFQ_SUCCESS;
 }
 
 int hwfq_cancel(hwfq_scheduler_t *scheduler,

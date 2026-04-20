@@ -64,11 +64,15 @@ typedef struct {
 typedef struct {
     uint32_t max_tenants;          // Maximum number of tenants (e.g., 4000)
     uint32_t max_flows_per_tenant; // Maximum flows per tenant (e.g., 100000)
-    uint32_t max_total_flows;      // Total pre-allocated flow states (all tenants combined)
-                                   // Memory: ~88 bytes per flow + Trie overhead
-                                   // Example: 1M = ~90 MB, 10M = ~900 MB
-    uint32_t num_groups;           // Number of service interval groups (default: 16)
-    uint32_t bins_per_group;       // Bins per group for finish times (default: 2048)
+    uint32_t max_total_flows;      // Global cap on flows across all tenants.
+                                   // hwfq_add_flow returns HWFQ_ERR_NO_MEMORY
+                                   // once this limit is reached. If set to 0,
+                                   // no global cap is enforced (only the
+                                   // per-tenant max_flows_per_tenant limit).
+    uint32_t num_groups;           // Number of service interval groups
+                                   // (0 = use default of 16)
+    uint32_t bins_per_group;       // Bins per group for finish times
+                                   // (0 = use default of 2048)
 
     // Total system capacity specification
     uint64_t total_capacity; // Total node capacity in work units/sec
@@ -84,12 +88,14 @@ typedef struct {
     void (*session_available_fn)(hwfq_scheduler_t *);
 
     // Callback function for timed-out sessions (NULL = timeouts not reported)
-    // Signature: void callback(scheduler, tenant_id, flow_id, user_data, work_size, timeout_ns)
+    // Invoked by hwfq_check_timeouts outside the scheduler lock. The callback
+    // must not destroy the scheduler or hold locks that could deadlock with
+    // concurrent hwfq_enqueue/dequeue/complete calls from other threads.
     void (*session_timeout_fn)(hwfq_scheduler_t *scheduler,
                                hwfq_tenant_id_t tenant_id,
                                hwfq_flow_id_t flow_id,
                                void *user_data,
-                               size_t work_size,
+                               uint64_t work_size,
                                uint64_t timeout_ns);
 } hwfq_config_t;
 
@@ -250,13 +256,30 @@ int hwfq_get_capacity_info(hwfq_scheduler_t *scheduler, hwfq_capacity_info_t *ca
 // enqueue, dequeue, complete, cancel, and check_timeouts concurrently.
 //
 
-// Cleanup callback for session user_data (called if session destroyed without dequeue)
+// Cleanup callback for session user_data.
+//
+// Invoked by the scheduler ONLY when a session is disposed of by the library
+// itself, never by the caller's normal dequeue/complete path. Specifically:
+//
+//   - hwfq_destroy         — fires for every session still queued.
+//   - hwfq_cancel          — fires for the cancelled session.
+//   - hwfq_check_timeouts  — fires for each timed-out session (in addition to
+//                            session_timeout_fn, which is informational).
+//   - tenant/flow removal with outstanding backlog — cannot happen because
+//                            the library rejects removal with
+//                            HWFQ_ERR_TENANT_HAS_BACKLOG; drain first.
+//
+// cleanup_fn is NOT invoked after a successful hwfq_dequeue. Once the caller
+// receives a session from dequeue, ownership of user_data transfers to the
+// caller until hwfq_complete (or hwfq_cancel) is called.
 typedef void (*hwfq_session_cleanup_fn)(void *user_data);
 
 // Session to be scheduled
 typedef struct {
     void *user_data;    // User-defined data pointer
-    size_t work_size;   // Size of work (bytes, ops, etc.)
+    uint64_t work_size; // Size of work (bytes, ops, etc.) - uint64_t to match
+                        // scheduler internal time-math domain and avoid
+                        // platform-dependent truncation.
     uint64_t timestamp; // Enqueue timestamp (optional)
     uint64_t timeout_ns; // Per-session timeout in nanoseconds (0 = no timeout)
     hwfq_session_cleanup_fn cleanup_fn; // Called to free user_data if session destroyed without dequeue (optional)
@@ -290,19 +313,30 @@ int hwfq_dequeue(hwfq_scheduler_t *scheduler, hwfq_session_t *work_out,
 // tenant_id - Tenant that owned the work
 // flow_id - Flow that owned the work
 // completion_time_ns - Time when work completed (nanoseconds)
-void hwfq_complete(hwfq_scheduler_t *scheduler, const hwfq_session_t *work,
-                   hwfq_tenant_id_t tenant_id, hwfq_flow_id_t flow_id, uint64_t completion_time_ns);
+// returns - HWFQ_SUCCESS on success; HWFQ_ERR_INVALID_ARG if scheduler is NULL;
+//           HWFQ_ERR_NOT_FOUND if no in-flight session matches the given
+//           (tenant_id, flow_id [, user_data]) tuple. Callers may ignore the
+//           return value safely; checking it detects double-complete and
+//           mis-routed complete calls.
+int hwfq_complete(hwfq_scheduler_t *scheduler, const hwfq_session_t *work,
+                  hwfq_tenant_id_t tenant_id, hwfq_flow_id_t flow_id, uint64_t completion_time_ns);
 
 // Cancel an in-flight session without completing it
 //
 // scheduler - Scheduler handle
-// work - Session to cancel (matched by user_data, can be NULL to match any)
+// work - Session to cancel. If work->user_data is non-NULL it uniquely
+//        identifies the session. If work is NULL or work->user_data is NULL,
+//        the scheduler cancels the first in-flight session matching
+//        (tenant_id, flow_id) in enqueue order. When multiple matching
+//        sessions exist, callers that need deterministic selection must
+//        supply a distinct user_data per session.
 // tenant_id - Tenant that owns the session
 // flow_id - Flow that owns the session
 // returns - 0 on success, HWFQ_ERR_NOT_FOUND if session not in-flight
 //
 // This removes the session from the in-flight list and frees capacity,
-// but does NOT update completion statistics.
+// but does NOT update completion statistics. Invokes the session's
+// cleanup_fn (if set) exactly once.
 // Use this when work is abandoned or errors occur.
 int hwfq_cancel(hwfq_scheduler_t *scheduler, const hwfq_session_t *work,
                 hwfq_tenant_id_t tenant_id, hwfq_flow_id_t flow_id);

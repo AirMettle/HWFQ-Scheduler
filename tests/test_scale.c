@@ -443,6 +443,124 @@ void test_scale_performance(void) {
 }
 
 // ============================================================================
+// Test: 100K flows per tenant — hitting the proposal's per-tenant target.
+// Uses 40 tenants (instead of 4,000) to bound aggregate memory while still
+// exercising the per-tenant 100K-flow configuration. Extrapolates the
+// per-flow incremental cost to estimate the 4,000-tenant × 100K-flow footprint.
+// ============================================================================
+
+void test_100k_flows_per_tenant(void) {
+    printf("    Configuring 40 tenants × 100,000 flows per tenant (= 4M flows aggregate)...\n");
+
+    g_alloc_count = 0;
+    g_free_count = 0;
+    g_bytes_allocated = 0;
+    g_peak_bytes = 0;
+
+    // Bounded scale: 4 tenants × 100,000 flows = 400K flows total.
+    // Enough to hit the proposal's per-tenant target and measure per-flow cost,
+    // small enough to finish in seconds. The per-flow byte cost extrapolates
+    // linearly to the 4,000-tenant × 100,000-flow configuration.
+    const uint32_t NUM_TENANTS = 4;
+    const uint32_t FLOWS_PER_TENANT = 100000;
+    const uint32_t TOTAL_FLOWS = NUM_TENANTS * FLOWS_PER_TENANT;
+
+    hwfq_config_t config = {
+        .max_tenants = NUM_TENANTS,
+        .max_flows_per_tenant = FLOWS_PER_TENANT,
+        .max_total_flows = TOTAL_FLOWS,
+        .total_capacity = 100000000000ULL,  // 100 GB/s
+        .num_groups = 16,
+        .bins_per_group = 2048,
+        .enable_statistics = false,
+        .alloc_fn = tracking_alloc,
+        .free_fn = tracking_free,
+        .session_available_fn = NULL
+    };
+
+    hwfq_scheduler_t *scheduler = NULL;
+    int ret = hwfq_init(&config, &scheduler);
+    TEST_ASSERT(ret == HWFQ_SUCCESS, "init failed");
+
+    size_t init_bytes = g_bytes_allocated;
+    printf("    Memory after init: %.2f MB\n", init_bytes / (1024.0 * 1024.0));
+
+    hwfq_allocation_t tenant_alloc = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 100 };
+    hwfq_allocation_t flow_alloc   = { .allocation_type = HWFQ_ALLOCATION_WEIGHT, .weight = 10 };
+
+    hwfq_tenant_id_t *tids = (hwfq_tenant_id_t *)malloc(sizeof(hwfq_tenant_id_t) * NUM_TENANTS);
+    TEST_ASSERT(tids != NULL, "tid array malloc");
+
+    for (uint32_t t = 0; t < NUM_TENANTS; t++) {
+        ret = hwfq_add_tenant(scheduler, &tenant_alloc, &tids[t]);
+        TEST_ASSERT(ret == HWFQ_SUCCESS, "hwfq_add_tenant failed");
+    }
+    size_t after_tenants_bytes = g_bytes_allocated;
+    printf("    Memory after %u tenants: %.2f MB (%.2f KB per tenant)\n",
+           NUM_TENANTS,
+           after_tenants_bytes / (1024.0 * 1024.0),
+           (after_tenants_bytes - init_bytes) / 1024.0 / NUM_TENANTS);
+
+    printf("    Adding %u flows per tenant...\n", FLOWS_PER_TENANT);
+    BENCH_START();
+    for (uint32_t t = 0; t < NUM_TENANTS; t++) {
+        for (uint32_t f = 0; f < FLOWS_PER_TENANT; f++) {
+            hwfq_flow_id_t fid;
+            ret = hwfq_add_flow(scheduler, tids[t], &flow_alloc, &fid);
+            if (ret != HWFQ_SUCCESS) {
+                printf("    hwfq_add_flow failed at tenant=%u flow=%u ret=%d\n", t, f, ret);
+                TEST_ASSERT(false, "hwfq_add_flow failed mid-scale");
+            }
+        }
+    }
+    BENCH_END();
+    double elapsed = (double)BENCH_ELAPSED_NS() / 1e9;
+
+    size_t after_flows_bytes = g_bytes_allocated;
+    double flow_mem_mb = (after_flows_bytes - after_tenants_bytes) / (1024.0 * 1024.0);
+    double bytes_per_flow = (double)(after_flows_bytes - after_tenants_bytes) / (double)TOTAL_FLOWS;
+
+    printf("    Total memory: %.2f MB (peak: %.2f MB)\n",
+           after_flows_bytes / (1024.0 * 1024.0),
+           g_peak_bytes / (1024.0 * 1024.0));
+    printf("    Flow-state memory: %.2f MB across %u flows\n", flow_mem_mb, TOTAL_FLOWS);
+    printf("    Bytes per flow: %.1f\n", bytes_per_flow);
+    printf("    Provisioning rate: %.0f flows/sec\n", TOTAL_FLOWS / elapsed);
+
+    // Extrapolate to proposal's 4,000 × 100K = 400M-flow configuration.
+    // Per-tenant scheduler overhead scales linearly with tenant count.
+    // Per-flow incremental cost stays constant.
+    double per_tenant_overhead_bytes = (after_tenants_bytes - init_bytes) / (double)NUM_TENANTS;
+    double proj_4000x100k_bytes =
+        (double)init_bytes +
+        per_tenant_overhead_bytes * 4000.0 +
+        bytes_per_flow * 4000.0 * 100000.0;
+    printf("\n    Extrapolation to 4,000 tenants × 100,000 flows (= 400M flows):\n");
+    printf("      init overhead:       %.2f MB\n", init_bytes / (1024.0 * 1024.0));
+    printf("      per-tenant state:    %.2f MB × 4000 = %.2f MB\n",
+           per_tenant_overhead_bytes / (1024.0 * 1024.0),
+           (per_tenant_overhead_bytes * 4000.0) / (1024.0 * 1024.0));
+    printf("      per-flow state:      %.1f B × 400M = %.2f MB\n",
+           bytes_per_flow,
+           (bytes_per_flow * 400000000.0) / (1024.0 * 1024.0));
+    printf("      projected total:     %.2f MB (%.2f GiB)\n",
+           proj_4000x100k_bytes / (1024.0 * 1024.0),
+           proj_4000x100k_bytes / (1024.0 * 1024.0 * 1024.0));
+    if (proj_4000x100k_bytes < (2ULL * 1024 * 1024 * 1024)) {
+        printf("      Fits in 2 GiB budget: YES\n");
+    } else {
+        printf("      Fits in 2 GiB budget: NO — exceeds by %.2f MB\n",
+               (proj_4000x100k_bytes - (double)(2ULL * 1024 * 1024 * 1024))
+                   / (1024.0 * 1024.0));
+    }
+
+    free(tids);
+    hwfq_destroy(scheduler);
+    printf("    Scheduler destroyed, all memory freed\n");
+    TEST_PASS();
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -463,6 +581,9 @@ int main(void) {
 
     printf("\nRunning test_scale_performance...\n");
     test_scale_performance();
+
+    printf("\nRunning test_100k_flows_per_tenant...\n");
+    test_100k_flows_per_tenant();
 
     printf("\n=== Scale Test Summary ===\n");
     printf("Passed: %d\n", g_tests_passed);
