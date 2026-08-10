@@ -63,6 +63,7 @@ coverage/
 # Documentation build
 docs/_build/
 *.pdf
+!docs/*.pdf
 
 # OS specific
 Thumbs.db
