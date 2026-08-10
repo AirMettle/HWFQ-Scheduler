@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 AirMettle, Inc.
+
 #include "hwfq_internal.h"
 #include <stdlib.h>
 #include <string.h>

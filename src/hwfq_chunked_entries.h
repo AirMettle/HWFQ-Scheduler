@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 AirMettle, Inc.
+
 #ifndef HWFQ_CHUNKED_ENTRIES_H
 #define HWFQ_CHUNKED_ENTRIES_H
 
