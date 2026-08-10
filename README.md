@@ -36,7 +36,11 @@ HWFQ-Scheduler/
 │   └── *.h                     # Internal headers
 ├── tests/                      # Test suite
 ├── examples/                   # Usage examples
-└── Makefile                    # Build configuration
+├── docs/                       # Reference papers
+├── Makefile                    # Build configuration
+├── CMakeLists.txt              # CMake build configuration
+├── CITATION.cff                # Citation metadata (cite the JSAC '99 paper)
+└── LICENSE                     # MIT license
 ```
 
 ## Modules
@@ -64,6 +68,8 @@ HWFQ-Scheduler/
 
 ## Building
 
+Requires a C11 compiler (GCC or Clang), POSIX threads, and `make` or CMake ≥ 3.14.
+
 ```bash
 # Build library and tests (debug mode)
 make
@@ -73,6 +79,13 @@ make MODE=release all
 
 # Clean build artifacts
 make clean
+```
+
+Alternatively, with CMake:
+
+```bash
+cmake -B build-cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cmake
 ```
 
 The build produces:
@@ -167,3 +180,18 @@ Tenants and flows can be configured with either:
 | -6   | `HWFQ_ERR_NO_WORK`             | No sessions available for scheduling       |
 | -7   | `HWFQ_ERR_TENANT_HAS_BACKLOG`  | Cannot remove tenant with pending sessions |
 | -99  | `HWFQ_ERR_INTERNAL`            | Internal error                             |
+
+## References
+
+The scheduler design builds on the following work:
+
+- Donpaul C. Stephens, Jon C. R. Bennett, and Hui Zhang, "[Implementing scheduling algorithms in high-speed networks](https://doi.org/10.1109/49.772449)," *IEEE Journal on Selected Areas in Communications*, vol. 17, no. 6, pp. 1145–1158, June 1999. ([PDF in this repo](docs/JSAC99-Stephens-Bennett-Zhang.pdf))
+- Jon C. R. Bennett and Hui Zhang, "[Hierarchical packet fair queueing algorithms](https://doi.org/10.1109/90.649568)," *IEEE/ACM Transactions on Networking*, vol. 5, no. 5, pp. 675–689, Oct. 1997. ([PDF in this repo](docs/TON97-Bennett-Zhang.pdf))
+
+## Acknowledgment
+
+This material is based upon work supported by the U.S. Department of Energy, Office of Science, under Award Number DE-SC0026122. Any opinions, findings, conclusions, or recommendations expressed in this material are those of the authors and do not necessarily reflect the views of the U.S. Department of Energy.
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
