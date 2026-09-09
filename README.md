@@ -1,6 +1,6 @@
 # HWFQ-Scheduler
 
-Hierarchical Weighted Fair Queueing (H-WFQ) scheduler for resource allocation and isolation in HPC storage systems.
+Hierarchical Weighted Fair Queueing (H-WFQ) scheduler for resource allocation and isolation.
 
 ## Overview
 
