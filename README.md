@@ -1,4 +1,4 @@
-# HWFQ-Scheduler
+# Hierarchical WFQ Scheduler
 
 Hierarchical Weighted Fair Queueing (H-WFQ) scheduler for resource allocation and isolation.
 
