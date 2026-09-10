@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 AirMettle, Inc.
+
 #include "hwfq_group_scheduler.h"
 #include "test_common.h"
 #include <stdio.h>

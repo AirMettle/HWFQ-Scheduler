@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025-2026 AirMettle, Inc.
+
 #define _POSIX_C_SOURCE 199309L
 #include "hwfq_group_scheduler_internal.h"
 #include "hwfq_chunked_entries.h"

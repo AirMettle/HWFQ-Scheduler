@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build-cmake/
 *.o
 *.a
 *.so
@@ -63,6 +64,7 @@ coverage/
 # Documentation build
 docs/_build/
 *.pdf
+!docs/*.pdf
 
 # OS specific
 Thumbs.db

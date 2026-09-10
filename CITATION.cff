@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "HWFQ-Scheduler"
+type: software
+authors:
+  - name: "AirMettle, Inc."
+repository-code: "https://github.com/AirMettle/HWFQ-Scheduler"
+license: MIT
+preferred-citation:
+  type: article
+  title: "Implementing scheduling algorithms in high-speed networks"
+  authors:
+    - family-names: "Stephens"
+      given-names: "Donpaul C."
+    - family-names: "Bennett"
+      given-names: "Jon C. R."
+    - family-names: "Zhang"
+      given-names: "Hui"
+  journal: "IEEE Journal on Selected Areas in Communications"
+  volume: 17
+  issue: 6
+  start: 1145
+  end: 1158
+  year: 1999
+  month: 6
+  doi: "10.1109/49.772449"
